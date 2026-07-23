@@ -3,7 +3,7 @@ QT += core gui widgets serialport
 CONFIG += c++11 warn_on
 TEMPLATE = app
 TARGET = RxDataTester
-VERSION = 1.0.0
+VERSION = 1.1.0
 
 DEFINES += QT_DEPRECATED_WARNINGS
 

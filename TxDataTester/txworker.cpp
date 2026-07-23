@@ -13,7 +13,53 @@ namespace
 constexpr int kStatisticsIntervalMs = 1000;
 constexpr qint64 kPeriodicLogIntervalMs = 20 * 1000;
 constexpr qint64 kMinimumPendingOutputBytes = 4 * 1024;
+
+/**
+ * @brief Returns a fixed English description for a serial-port error.
+ * @param error QSerialPort error value to describe.
+ * @return English text that does not depend on the operating-system language.
+ * @detail Maps every QSerialPort::SerialPortError available in Qt 5.12 to a concise
+ *         message suitable for EVENTS and text logs.
+ */
+QString serialPortErrorText(QSerialPort::SerialPortError error)
+{
+    switch (error)
+    {
+    case QSerialPort::NoError:
+        return QStringLiteral("no error");
+    case QSerialPort::DeviceNotFoundError:
+        return QStringLiteral("device not found");
+    case QSerialPort::PermissionError:
+        return QStringLiteral("permission denied");
+    case QSerialPort::OpenError:
+        return QStringLiteral("open error");
+    case QSerialPort::NotOpenError:
+        return QStringLiteral("port is not open");
+    case QSerialPort::ParityError:
+        return QStringLiteral("parity error");
+    case QSerialPort::FramingError:
+        return QStringLiteral("framing error");
+    case QSerialPort::BreakConditionError:
+        return QStringLiteral("break condition");
+    case QSerialPort::WriteError:
+        return QStringLiteral("write error");
+    case QSerialPort::ReadError:
+        return QStringLiteral("read error");
+    case QSerialPort::ResourceError:
+        return QStringLiteral("resource error or operation aborted");
+    case QSerialPort::UnsupportedOperationError:
+        return QStringLiteral("unsupported operation");
+    case QSerialPort::UnknownError:
+        return QStringLiteral("unknown serial-port error");
+    case QSerialPort::TimeoutError:
+        return QStringLiteral("operation timed out");
+    }
+
+    return QStringLiteral("unrecognized serial-port error");
 }
+}
+
+/*-----------------------------------------------------------------------------*/
 
 /**
  * @brief Creates the transmitter worker object.
@@ -163,7 +209,7 @@ void TxWorker::openPort(const QString &portName,
 {
     if (!m_initialized || m_serialPort == nullptr)
     {
-        emitWorkerEvent(tr("ошибка открытия: рабочий TX-поток не инициализирован"),
+        emitWorkerEvent(tr("open error: the TX worker thread is not initialized"),
                         true);
         emit portStateChanged(false, portName, settingsDescription, false);
         return;
@@ -171,7 +217,7 @@ void TxWorker::openPort(const QString &portName,
 
     if (m_serialPort->isOpen())
     {
-        emitWorkerEvent(tr("порт %1 уже открыт").arg(m_serialPort->portName()),
+        emitWorkerEvent(tr("port %1 is already open").arg(m_serialPort->portName()),
                         true);
         emit portStateChanged(true,
                               m_openPortName,
@@ -195,7 +241,7 @@ void TxWorker::openPort(const QString &portName,
         || !parityValid
         || !stopBitsValid)
     {
-        emitWorkerEvent(tr("ошибка открытия: переданы некорректные настройки порта"),
+        emitWorkerEvent(tr("open error: invalid port settings were provided"),
                         true);
         emit portStateChanged(false, portName, settingsDescription, false);
         return;
@@ -207,9 +253,9 @@ void TxWorker::openPort(const QString &portName,
 
     if (!m_serialPort->open(QIODevice::ReadWrite))
     {
-        const QString errorText = m_serialPort->errorString();
+        const QString errorText = serialPortErrorText(m_serialPort->error());
         m_openOperationInProgress = false;
-        emitWorkerEvent(tr("не удалось открыть порт %1: %2")
+        emitWorkerEvent(tr("failed to open port %1: %2")
                             .arg(portName, errorText),
                         true);
         emit portStateChanged(false, portName, settingsDescription, false);
@@ -225,10 +271,10 @@ void TxWorker::openPort(const QString &portName,
 
     if (!configured)
     {
-        const QString errorText = m_serialPort->errorString();
+        const QString errorText = serialPortErrorText(m_serialPort->error());
         m_serialPort->close();
         m_openOperationInProgress = false;
-        emitWorkerEvent(tr("ошибка настройки порта %1: %2")
+        emitWorkerEvent(tr("failed to configure port %1: %2")
                             .arg(portName, errorText),
                         true);
         emit portStateChanged(false, portName, settingsDescription, false);
@@ -237,10 +283,10 @@ void TxWorker::openPort(const QString &portName,
 
     if (!m_serialPort->clear(QSerialPort::AllDirections))
     {
-        const QString errorText = m_serialPort->errorString();
+        const QString errorText = serialPortErrorText(m_serialPort->error());
         m_serialPort->close();
         m_openOperationInProgress = false;
-        emitWorkerEvent(tr("не удалось очистить буферы порта %1 после открытия: %2")
+        emitWorkerEvent(tr("failed to clear port %1 buffers after opening: %2")
                             .arg(portName, errorText),
                         true);
         emit portStateChanged(false, portName, settingsDescription, false);
@@ -255,7 +301,7 @@ void TxWorker::openPort(const QString &portName,
                           m_openPortName,
                           m_openPortSettingsDescription,
                           false);
-    emitWorkerEvent(tr("порт %1 открыт: %2")
+    emitWorkerEvent(tr("port %1 opened: %2")
                         .arg(m_openPortName, m_openPortSettingsDescription),
                     false);
 }
@@ -299,7 +345,7 @@ void TxWorker::closePort()
     const bool buffersCleared = m_serialPort->clear(QSerialPort::AllDirections);
     const QString clearErrorText = buffersCleared
                                        ? QString()
-                                       : m_serialPort->errorString();
+                                       : serialPortErrorText(m_serialPort->error());
     m_serialPort->close();
     m_openOperationInProgress = false;
 
@@ -308,13 +354,13 @@ void TxWorker::closePort()
 
     if (!buffersCleared)
     {
-        emitWorkerEvent(tr("не удалось очистить буферы порта %1 перед закрытием: %2")
+        emitWorkerEvent(tr("failed to clear port %1 buffers before closing: %2")
                             .arg(portName, clearErrorText),
                         true);
     }
 
     emit portStateChanged(false, portName, settingsText, false);
-    emitWorkerEvent(tr("порт %1 закрыт: %2").arg(portName, settingsText),
+    emitWorkerEvent(tr("port %1 closed: %2").arg(portName, settingsText),
                     false);
 }
 
@@ -339,7 +385,7 @@ void TxWorker::startContinuous(int counterBits,
 {
     if (!m_initialized || m_serialPort == nullptr || !m_serialPort->isOpen())
     {
-        emitWorkerEvent(tr("START невозможен: COM-порт не открыт"), true);
+        emitWorkerEvent(tr("START failed: the COM port is not open"), true);
         emitTransmissionState();
         return;
     }
@@ -349,7 +395,7 @@ void TxWorker::startContinuous(int counterBits,
         || m_outputDrainActive
         || m_serialPort->bytesToWrite() > 0)
     {
-        emitWorkerEvent(tr("START невозможен: предыдущая передача еще не завершена"),
+        emitWorkerEvent(tr("START failed: the previous transmission has not finished yet"),
                         true);
         emitTransmissionState();
         return;
@@ -364,7 +410,7 @@ void TxWorker::startContinuous(int counterBits,
                              &settings,
                              &errorText))
     {
-        emitWorkerEvent(tr("ошибка Pattern: %1").arg(errorText), true);
+        emitWorkerEvent(tr("Pattern error: %1").arg(errorText), true);
         emitTransmissionState();
         return;
     }
@@ -378,14 +424,14 @@ void TxWorker::startContinuous(int counterBits,
     resetStatistics(settings);
     emitTransmissionState();
 
-    emitWorkerEvent(tr("START: циклическая передача запущена; %1")
+    emitWorkerEvent(tr("START: continuous transmission started; %1")
                         .arg(patternDescription),
                     false);
 
     if (!sendDataBlock(m_activePattern))
     {
         stopContinuousInternal(
-            tr("циклическая передача остановлена из-за ошибки первого блока"),
+            tr("continuous transmission stopped because the first block failed"),
             true,
             true);
         return;
@@ -445,7 +491,7 @@ void TxWorker::sendSingle(int counterBits,
 {
     if (!m_initialized || m_serialPort == nullptr || !m_serialPort->isOpen())
     {
-        emitWorkerEvent(tr("SINGLE невозможен: COM-порт не открыт"), true);
+        emitWorkerEvent(tr("SINGLE failed: the COM port is not open"), true);
         emitTransmissionState();
         return;
     }
@@ -455,7 +501,7 @@ void TxWorker::sendSingle(int counterBits,
         || m_outputDrainActive
         || m_serialPort->bytesToWrite() > 0)
     {
-        emitWorkerEvent(tr("SINGLE невозможен: предыдущая передача еще не завершена"),
+        emitWorkerEvent(tr("SINGLE failed: the previous transmission has not finished yet"),
                         true);
         emitTransmissionState();
         return;
@@ -470,7 +516,7 @@ void TxWorker::sendSingle(int counterBits,
                              &settings,
                              &errorText))
     {
-        emitWorkerEvent(tr("ошибка Pattern: %1").arg(errorText), true);
+        emitWorkerEvent(tr("Pattern error: %1").arg(errorText), true);
         emitTransmissionState();
         return;
     }
@@ -492,7 +538,7 @@ void TxWorker::sendSingle(int counterBits,
         return;
     }
 
-    emitWorkerEvent(tr("SINGLE: один блок поставлен на передачу; %1")
+    emitWorkerEvent(tr("SINGLE: one block queued for transmission; %1")
                         .arg(patternDescription),
                     false);
 }
@@ -547,20 +593,20 @@ void TxWorker::shutdown()
             m_serialPort->clear(QSerialPort::AllDirections);
         const QString clearErrorText = buffersCleared
                                            ? QString()
-                                           : m_serialPort->errorString();
+                                           : serialPortErrorText(m_serialPort->error());
         m_serialPort->close();
         m_openOperationInProgress = false;
 
         if (!buffersCleared)
         {
             emitWorkerEvent(
-                tr("не удалось очистить буферы порта %1 при завершении: %2")
+                tr("failed to clear port %1 buffers during shutdown: %2")
                     .arg(portName, clearErrorText),
                 true);
         }
 
         emit portStateChanged(false, portName, settingsText, false);
-        emitWorkerEvent(tr("порт %1 закрыт при завершении программы: %2")
+        emitWorkerEvent(tr("port %1 closed during application shutdown: %2")
                             .arg(portName, settingsText),
                         false);
     }
@@ -604,7 +650,7 @@ void TxWorker::sendNextBlock()
     if (!m_serialPort->isOpen())
     {
         handlePortFailure(
-            tr("передача остановлена: COM-порт больше не открыт"));
+            tr("transmission stopped: the COM port is no longer open"));
         return;
     }
 
@@ -619,7 +665,7 @@ void TxWorker::sendNextBlock()
         if (m_testRunning)
         {
             stopContinuousInternal(
-                tr("циклическая передача остановлена из-за ошибки записи"),
+                tr("continuous transmission stopped because of a write error"),
                 true,
                 true);
         }
@@ -718,7 +764,7 @@ void TxWorker::handleBytesWritten(qint64 bytes)
     m_periodicLogStatisticsActive = false;
     emitTransmissionState();
 
-    emitWorkerEvent(tr("SINGLE: передача блока завершена, передано %1 байт")
+    emitWorkerEvent(tr("SINGLE: block transmission completed, %1 bytes transmitted")
                         .arg(m_totalBytesWritten),
                     false);
 }
@@ -746,7 +792,7 @@ void TxWorker::checkPortHealth()
     }
 
     handlePortFailure(
-        tr("открытый порт %1 неожиданно закрылся")
+        tr("open port %1 closed unexpectedly")
             .arg(m_openPortName));
 }
 
@@ -785,10 +831,10 @@ void TxWorker::handleSerialError(QSerialPort::SerialPortError error)
                                  ? serialPortName
                                  : (!m_openPortName.isEmpty()
                                         ? m_openPortName
-                                        : tr("неизвестный порт"));
+                                        : tr("unknown port"));
     const QString message =
-        tr("ошибка порта %1: %2 (код %3)")
-            .arg(portName, m_serialPort->errorString())
+        tr("port %1 error: %2 (code %3)")
+            .arg(portName, serialPortErrorText(error))
             .arg(static_cast<int>(error));
 
     const bool criticalError =
@@ -843,21 +889,21 @@ bool TxWorker::makePatternSettings(int counterBits,
         && counterBits != 32
         && counterBits != 64)
     {
-        *errorText = tr("неподдерживаемая разрядность счетчика");
+        *errorText = tr("unsupported counter width");
         return false;
     }
 
     const int counterBytes = counterBits / 8;
     if (blockBytes <= 0 || (blockBytes % counterBytes) != 0)
     {
-        *errorText = tr("размер блока должен быть положительным и кратным %1 байт")
+        *errorText = tr("block size must be positive and a multiple of %1 bytes")
                          .arg(counterBytes);
         return false;
     }
 
     if (periodMs < 0)
     {
-        *errorText = tr("период не может быть отрицательным");
+        *errorText = tr("period cannot be negative");
         return false;
     }
 
@@ -867,7 +913,7 @@ bool TxWorker::makePatternSettings(int counterBits,
             : (quint64(1) << counterBits) - 1;
     if (initialValue > maximumCounterValue)
     {
-        *errorText = tr("начальное значение не помещается в %1 бит")
+        *errorText = tr("initial value does not fit in %1 bits")
                          .arg(counterBits);
         return false;
     }
@@ -1093,12 +1139,12 @@ void TxWorker::stopContinuousInternal(const QString &eventText,
         const bool outputCleared = m_serialPort->clear(QSerialPort::Output);
         const QString clearErrorText = outputCleared
                                            ? QString()
-                                           : m_serialPort->errorString();
+                                           : serialPortErrorText(m_serialPort->error());
         m_openOperationInProgress = false;
 
         if (!outputCleared)
         {
-            emitWorkerEvent(tr("не удалось очистить выходную очередь %1: %2")
+            emitWorkerEvent(tr("failed to clear the %1 output queue: %2")
                                 .arg(m_serialPort->portName(), clearErrorText),
                             true);
         }
@@ -1143,8 +1189,8 @@ void TxWorker::finishOutputDrain()
     m_statisticsTimer->stop();
     emitTransmissionState();
 
-    emitWorkerEvent(tr("STOP завершен; остаток выходной очереди передан; "
-                       "всего передано %1 байт")
+    emitWorkerEvent(tr("STOP completed; the remaining output queue was transmitted; "
+                       "%1 bytes transmitted in total")
                         .arg(m_totalBytesWritten),
                     false);
 }
@@ -1178,12 +1224,12 @@ void TxWorker::cancelSingleTransfer(bool clearOutputQueue)
         const bool outputCleared = m_serialPort->clear(QSerialPort::Output);
         const QString clearErrorText = outputCleared
                                            ? QString()
-                                           : m_serialPort->errorString();
+                                           : serialPortErrorText(m_serialPort->error());
         m_openOperationInProgress = false;
 
         if (!outputCleared)
         {
-            emitWorkerEvent(tr("не удалось очистить выходную очередь %1: %2")
+            emitWorkerEvent(tr("failed to clear the %1 output queue: %2")
                                 .arg(m_serialPort->portName(), clearErrorText),
                             true);
         }
@@ -1224,7 +1270,7 @@ void TxWorker::handlePortFailure(const QString &reason)
                                  ? m_openPortName
                                  : (!m_serialPort->portName().trimmed().isEmpty()
                                         ? m_serialPort->portName().trimmed()
-                                        : tr("неизвестный порт"));
+                                        : tr("unknown port"));
     const QString settingsText = m_openPortSettingsDescription;
 
     if (m_testRunning)
@@ -1233,7 +1279,7 @@ void TxWorker::handlePortFailure(const QString &reason)
         updateStatisticsSnapshot(false);
         m_testRunning = false;
         emitWorkerEvent(
-            tr("циклическая передача остановлена из-за потери COM-порта"),
+            tr("continuous transmission stopped because the COM port was lost"),
             true);
     }
 
@@ -1243,7 +1289,7 @@ void TxWorker::handlePortFailure(const QString &reason)
         m_singleTransferActive = false;
         m_singleBytesRemaining = 0;
         emitWorkerEvent(
-            tr("одиночная передача прервана из-за потери COM-порта"),
+            tr("single-block transmission was interrupted because the COM port was lost"),
             true);
     }
 
@@ -1252,7 +1298,7 @@ void TxWorker::handlePortFailure(const QString &reason)
         updateStatisticsSnapshot(false);
         m_outputDrainActive = false;
         emitWorkerEvent(
-            tr("передача остатка после STOP прервана из-за потери COM-порта"),
+            tr("transmission of the remaining STOP queue was interrupted because the COM port was lost"),
             true);
     }
 
@@ -1288,15 +1334,15 @@ void TxWorker::handlePortFailure(const QString &reason)
 void TxWorker::abortTransfersForPortClose(bool shutdownMode)
 {
     const QString operationSuffix = shutdownMode
-                                        ? tr("при завершении программы")
-                                        : tr("перед закрытием порта");
+                                        ? tr("during application shutdown")
+                                        : tr("before closing the port");
 
     if (m_testRunning)
     {
         m_transmitTimer->stop();
         updateStatisticsSnapshot(false);
         m_testRunning = false;
-        emitWorkerEvent(tr("циклическая передача остановлена %1")
+        emitWorkerEvent(tr("continuous transmission stopped %1")
                             .arg(operationSuffix),
                         false);
     }
@@ -1306,7 +1352,7 @@ void TxWorker::abortTransfersForPortClose(bool shutdownMode)
         updateStatisticsSnapshot(false);
         m_singleTransferActive = false;
         m_singleBytesRemaining = 0;
-        emitWorkerEvent(tr("одиночная передача прервана %1")
+        emitWorkerEvent(tr("single-block transmission interrupted %1")
                             .arg(operationSuffix),
                         false);
     }
@@ -1322,7 +1368,7 @@ void TxWorker::abortTransfersForPortClose(bool shutdownMode)
         updateStatisticsSnapshot(false);
         m_outputDrainActive = false;
         emitWorkerEvent(
-            tr("ожидание отправки остатка прервано %1; в очереди оставалось %2 байт")
+            tr("waiting for the remaining queue was interrupted %1; %2 bytes remained in the queue")
                 .arg(operationSuffix)
                 .arg(pendingBytes),
             false);
@@ -1350,7 +1396,7 @@ bool TxWorker::sendDataBlock(const PatternSettings &settings)
 {
     if (m_serialPort == nullptr || !m_serialPort->isOpen())
     {
-        emitWorkerEvent(tr("ошибка передачи: COM-порт не открыт"), true);
+        emitWorkerEvent(tr("transmission error: the COM port is not open"), true);
         return false;
     }
 
@@ -1366,7 +1412,7 @@ bool TxWorker::sendDataBlock(const PatternSettings &settings)
     catch (const std::bad_alloc &)
     {
         emitWorkerEvent(
-            tr("ошибка формирования блока: недостаточно памяти для %1 байт")
+            tr("block-generation error: not enough memory for %1 bytes")
                 .arg(settings.blockBytes),
             true);
         return false;
@@ -1377,14 +1423,14 @@ bool TxWorker::sendDataBlock(const PatternSettings &settings)
     {
         if (acceptedBytes < 0)
         {
-            emitWorkerEvent(tr("ошибка записи блока в %1: %2")
+            emitWorkerEvent(tr("failed to write a block to %1: %2")
                                 .arg(m_serialPort->portName(),
-                                     m_serialPort->errorString()),
+                                     serialPortErrorText(m_serialPort->error())),
                             true);
         }
         else
         {
-            emitWorkerEvent(tr("частичная запись в %1: принято %2 из %3 байт")
+            emitWorkerEvent(tr("partial write to %1: %2 of %3 bytes accepted")
                                 .arg(m_serialPort->portName())
                                 .arg(acceptedBytes)
                                 .arg(block.size()),

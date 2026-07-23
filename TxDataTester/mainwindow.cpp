@@ -8,6 +8,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QEvent>
+#include <QFileDevice>
 #include <QFont>
 #include <QFontDatabase>
 #include <QIODevice>
@@ -29,7 +30,55 @@
 namespace
 {
 constexpr int kPortRefreshIntervalMs = 1000;
+
+/**
+ * @brief Returns a fixed English description for a file error.
+ * @param error QFileDevice error value to describe.
+ * @return English text that does not depend on the operating-system language.
+ * @detail Converts QFileDevice::FileError values used during log creation into concise
+ *         messages suitable for EVENTS.
+ */
+QString fileErrorText(QFileDevice::FileError error)
+{
+    switch (error)
+    {
+    case QFileDevice::NoError:
+        return QStringLiteral("no error");
+    case QFileDevice::ReadError:
+        return QStringLiteral("read error");
+    case QFileDevice::WriteError:
+        return QStringLiteral("write error");
+    case QFileDevice::FatalError:
+        return QStringLiteral("fatal file error");
+    case QFileDevice::ResourceError:
+        return QStringLiteral("file resource error");
+    case QFileDevice::OpenError:
+        return QStringLiteral("file open error");
+    case QFileDevice::AbortError:
+        return QStringLiteral("file operation aborted");
+    case QFileDevice::TimeOutError:
+        return QStringLiteral("file operation timed out");
+    case QFileDevice::UnspecifiedError:
+        return QStringLiteral("unspecified file error");
+    case QFileDevice::RemoveError:
+        return QStringLiteral("file remove error");
+    case QFileDevice::RenameError:
+        return QStringLiteral("file rename error");
+    case QFileDevice::PositionError:
+        return QStringLiteral("file position error");
+    case QFileDevice::ResizeError:
+        return QStringLiteral("file resize error");
+    case QFileDevice::PermissionsError:
+        return QStringLiteral("file permission error");
+    case QFileDevice::CopyError:
+        return QStringLiteral("file copy error");
+    }
+
+    return QStringLiteral("unrecognized file error");
 }
+}
+
+/*-----------------------------------------------------------------------------*/
 
 /**
  * @brief Creates the main application window.
@@ -154,11 +203,11 @@ MainWindow::MainWindow(QWidget *parent)
             &MainWindow::handleSingleButton);
 
     initializeLogFile();
-    appendEvent(tr("запуск программы TxDataTester (v.1.4)"), EventType::Normal);
+    appendEvent(tr("TxDataTester (v.1.5) started"), EventType::Normal);
 
     if (m_logFile.isOpen())
     {
-        appendEvent(tr("создан лог-файл: %1")
+        appendEvent(tr("log file created: %1")
                         .arg(QDir::toNativeSeparators(m_logFile.fileName())),
                     EventType::Normal);
     }
@@ -247,7 +296,7 @@ void MainWindow::refreshSerialPorts()
             m_portLossRequestPending = true;
             updateControlStates();
             emit externalPortLossDetected(
-                tr("открытый порт %1 отключен от системы")
+                tr("open port %1 was disconnected from the system")
                     .arg(m_openPortName));
         }
 
@@ -272,7 +321,7 @@ void MainWindow::refreshSerialPorts()
 
         for (const QString &portName : addedNames)
         {
-            appendEvent(tr("обнаружен новый порт: %1")
+            appendEvent(tr("new port detected: %1")
                             .arg(currentDescriptions.value(portName,
                                                            portName)),
                         EventType::Normal);
@@ -280,7 +329,7 @@ void MainWindow::refreshSerialPorts()
 
         for (const QString &portName : removedNames)
         {
-            appendEvent(tr("порт исчез из списка доступных: %1")
+            appendEvent(tr("port disappeared from the available-port list: %1")
                             .arg(m_knownPortDescriptions.value(portName,
                                                               portName)),
                         EventType::Normal);
@@ -316,7 +365,7 @@ void MainWindow::openSerialPort()
     const QString portName = ui->portComboBox->currentText().trimmed();
     if (portName.isEmpty())
     {
-        appendEvent(tr("ошибка открытия: не выбран доступный COM-порт"),
+        appendEvent(tr("open error: no available COM port is selected"),
                     EventType::Error);
         return;
     }
@@ -326,7 +375,7 @@ void MainWindow::openSerialPort()
         ui->baudComboBox->currentText().toInt(&baudOk, 10);
     if (!baudOk || baudRate <= 0)
     {
-        appendEvent(tr("ошибка открытия: некорректная скорость COM-порта"),
+        appendEvent(tr("open error: invalid COM-port baud rate"),
                     EventType::Error);
         return;
     }
@@ -538,17 +587,17 @@ void MainWindow::startTest()
         return;
     }
 
-    appendEvent(tr("нажата кнопка START"), EventType::Action);
+    appendEvent(tr("START button pressed"), EventType::Action);
 
     if (!m_workerReady || !m_portOpen || m_txWorker == nullptr)
     {
-        appendEvent(tr("START невозможен: COM-порт не открыт"), EventType::Error);
+        appendEvent(tr("START failed: the COM port is not open"), EventType::Error);
         return;
     }
 
     if (m_singleTransferActive || m_outputDrainActive)
     {
-        appendEvent(tr("START невозможен: предыдущая передача еще не завершена"),
+        appendEvent(tr("START failed: the previous transmission has not finished yet"),
                     EventType::Error);
         return;
     }
@@ -561,7 +610,7 @@ void MainWindow::startTest()
     QString errorText;
     if (!readPatternSettings(&settings, &errorText))
     {
-        appendEvent(tr("ошибка Pattern: %1").arg(errorText), EventType::Error);
+        appendEvent(tr("Pattern error: %1").arg(errorText), EventType::Error);
         return;
     }
 
@@ -616,17 +665,17 @@ void MainWindow::handleSingleButton()
         return;
     }
 
-    appendEvent(tr("нажата кнопка SINGLE"), EventType::Action);
+    appendEvent(tr("SINGLE button pressed"), EventType::Action);
 
     if (!m_workerReady || !m_portOpen || m_txWorker == nullptr)
     {
-        appendEvent(tr("SINGLE невозможен: COM-порт не открыт"), EventType::Error);
+        appendEvent(tr("SINGLE failed: the COM port is not open"), EventType::Error);
         return;
     }
 
     if (m_testRunning || m_singleTransferActive || m_outputDrainActive)
     {
-        appendEvent(tr("SINGLE невозможен: предыдущая передача еще не завершена"),
+        appendEvent(tr("SINGLE failed: the previous transmission has not finished yet"),
                     EventType::Error);
         return;
     }
@@ -639,7 +688,7 @@ void MainWindow::handleSingleButton()
     QString errorText;
     if (!readPatternSettings(&settings, &errorText))
     {
-        appendEvent(tr("ошибка Pattern: %1").arg(errorText), EventType::Error);
+        appendEvent(tr("Pattern error: %1").arg(errorText), EventType::Error);
         return;
     }
 
@@ -818,8 +867,8 @@ void MainWindow::handleStopButtonAccepted(qint64 pendingBytes)
 
     appendTimestampedEvent(
         timestamp,
-        tr("нажата кнопка STOP; формирование новых блоков остановлено; "
-           "в очереди %1 байт")
+        tr("STOP button pressed; generation of new blocks stopped; "
+           "%1 bytes remain in the queue")
             .arg(qMax<qint64>(0, pendingBytes)),
         EventType::Action);
 }
@@ -1093,7 +1142,7 @@ void MainWindow::initializeLogFile()
     QDir applicationDirectory(QCoreApplication::applicationDirPath());
     if (!applicationDirectory.mkpath(QStringLiteral("logs")))
     {
-        appendEvent(tr("не удалось создать каталог logs в %1")
+        appendEvent(tr("failed to create the logs directory in %1")
                         .arg(QDir::toNativeSeparators(
                             applicationDirectory.absolutePath())),
                     EventType::Error);
@@ -1110,9 +1159,9 @@ void MainWindow::initializeLogFile()
     m_logFile.setFileName(filePath);
     if (!m_logFile.open(QIODevice::WriteOnly | QIODevice::Text))
     {
-        appendEvent(tr("не удалось создать лог-файл %1: %2")
+        appendEvent(tr("failed to create log file %1: %2")
                         .arg(QDir::toNativeSeparators(filePath),
-                             m_logFile.errorString()),
+                             fileErrorText(m_logFile.error())),
                     EventType::Error);
         return;
     }
@@ -1206,7 +1255,7 @@ void MainWindow::loadSettings()
 
     if (settings->status() != QSettings::NoError)
     {
-        appendEvent(tr("ошибка чтения сохраненных настроек QSettings"),
+        appendEvent(tr("failed to read saved QSettings"),
                     EventType::Error);
     }
 }
@@ -1257,7 +1306,7 @@ void MainWindow::saveSettings()
 
     if (settings.status() != QSettings::NoError)
     {
-        appendEvent(tr("ошибка сохранения настроек QSettings"),
+        appendEvent(tr("failed to save QSettings"),
                     EventType::Error);
     }
 }
@@ -1290,7 +1339,7 @@ void MainWindow::prepareShutdown()
             Qt::BlockingQueuedConnection);
         if (!invoked)
         {
-            appendEvent(tr("не удалось вызвать завершение рабочего TX-потока"),
+            appendEvent(tr("failed to invoke TX worker shutdown"),
                         EventType::Error);
         }
 
@@ -1311,7 +1360,7 @@ void MainWindow::prepareShutdown()
     m_portLossRequestPending = false;
 
     saveSettings();
-    appendEvent(tr("завершение программы TxDataTester (v.1.4)"),
+    appendEvent(tr("TxDataTester (v.1.5) stopped"),
                 EventType::Normal);
     closeLogFile();
 }
@@ -1447,7 +1496,7 @@ bool MainWindow::readPatternSettings(PatternSettings *settings,
         && counterBitsValue != 32
         && counterBitsValue != 64)
     {
-        *errorText = tr("неподдерживаемая разрядность счетчика");
+        *errorText = tr("unsupported counter width");
         return false;
     }
 
@@ -1459,7 +1508,7 @@ bool MainWindow::readPatternSettings(PatternSettings *settings,
         || blockBytesValue
                > static_cast<quint64>(std::numeric_limits<int>::max()))
     {
-        *errorText = tr("block, bytes должен быть положительным числом");
+        *errorText = tr("block, bytes must be a positive number");
         return false;
     }
 
@@ -1467,7 +1516,7 @@ bool MainWindow::readPatternSettings(PatternSettings *settings,
         static_cast<quint64>(counterBitsValue / 8);
     if ((blockBytesValue % counterBytesValue) != 0)
     {
-        *errorText = tr("block, bytes не кратен размеру счетчика");
+        *errorText = tr("block, bytes must be a multiple of the counter size");
         return false;
     }
 
@@ -1478,14 +1527,14 @@ bool MainWindow::readPatternSettings(PatternSettings *settings,
         || periodValue
                > static_cast<quint64>(std::numeric_limits<int>::max()))
     {
-        *errorText = tr("Period, ms выходит за допустимый диапазон");
+        *errorText = tr("Period, ms is outside the valid range");
         return false;
     }
 
     quint64 initialValue = 0;
     if (!parseInitialValue(&initialValue))
     {
-        *errorText = tr("init value не соответствует разрядности счетчика");
+        *errorText = tr("init value does not fit the selected counter width");
         return false;
     }
 

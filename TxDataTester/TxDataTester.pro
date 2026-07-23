@@ -3,7 +3,7 @@ QT += core gui widgets serialport
 CONFIG += c++11 warn_on
 TEMPLATE = app
 TARGET = TxDataTester
-VERSION = 1.4.0
+VERSION = 1.5.0
 
 DEFINES += QT_DEPRECATED_WARNINGS
 

@@ -12,7 +12,53 @@ namespace
 constexpr int kStatisticsIntervalMs = 1000;
 constexpr int kPortHealthIntervalMs = 1000;
 constexpr qint64 kPeriodicLogIntervalMs = 20 * 1000;
+
+/**
+ * @brief Returns a fixed English description for a serial-port error.
+ * @param error QSerialPort error value to describe.
+ * @return English text that does not depend on the operating-system language.
+ * @detail Maps every QSerialPort::SerialPortError available in Qt 5.12 to a concise
+ *         message suitable for EVENTS and text logs.
+ */
+QString serialPortErrorText(QSerialPort::SerialPortError error)
+{
+    switch (error)
+    {
+    case QSerialPort::NoError:
+        return QStringLiteral("no error");
+    case QSerialPort::DeviceNotFoundError:
+        return QStringLiteral("device not found");
+    case QSerialPort::PermissionError:
+        return QStringLiteral("permission denied");
+    case QSerialPort::OpenError:
+        return QStringLiteral("open error");
+    case QSerialPort::NotOpenError:
+        return QStringLiteral("port is not open");
+    case QSerialPort::ParityError:
+        return QStringLiteral("parity error");
+    case QSerialPort::FramingError:
+        return QStringLiteral("framing error");
+    case QSerialPort::BreakConditionError:
+        return QStringLiteral("break condition");
+    case QSerialPort::WriteError:
+        return QStringLiteral("write error");
+    case QSerialPort::ReadError:
+        return QStringLiteral("read error");
+    case QSerialPort::ResourceError:
+        return QStringLiteral("resource error or operation aborted");
+    case QSerialPort::UnsupportedOperationError:
+        return QStringLiteral("unsupported operation");
+    case QSerialPort::UnknownError:
+        return QStringLiteral("unknown serial-port error");
+    case QSerialPort::TimeoutError:
+        return QStringLiteral("operation timed out");
+    }
+
+    return QStringLiteral("unrecognized serial-port error");
 }
+}
+
+/*-----------------------------------------------------------------------------*/
 
 /**
  * @brief Creates the receiver worker object.
@@ -151,7 +197,7 @@ void RxWorker::openPort(const QString &portName,
 {
     if (!m_initialized || m_serialPort == nullptr)
     {
-        emitWorkerEvent(tr("ошибка открытия: рабочий RX-поток не инициализирован"),
+        emitWorkerEvent(tr("open error: the RX worker thread is not initialized"),
                         true);
         emit portStateChanged(false, portName, settingsDescription, false);
         return;
@@ -159,7 +205,7 @@ void RxWorker::openPort(const QString &portName,
 
     if (m_serialPort->isOpen())
     {
-        emitWorkerEvent(tr("порт %1 уже открыт").arg(m_serialPort->portName()),
+        emitWorkerEvent(tr("port %1 is already open").arg(m_serialPort->portName()),
                         true);
         emit portStateChanged(true,
                               m_openPortName,
@@ -183,7 +229,7 @@ void RxWorker::openPort(const QString &portName,
         || !parityValid
         || !stopBitsValid)
     {
-        emitWorkerEvent(tr("ошибка открытия: переданы некорректные настройки порта"),
+        emitWorkerEvent(tr("open error: invalid port settings were provided"),
                         true);
         emit portStateChanged(false, portName, settingsDescription, false);
         return;
@@ -195,9 +241,9 @@ void RxWorker::openPort(const QString &portName,
 
     if (!m_serialPort->open(QIODevice::ReadOnly))
     {
-        const QString errorText = m_serialPort->errorString();
+        const QString errorText = serialPortErrorText(m_serialPort->error());
         m_openOperationInProgress = false;
-        emitWorkerEvent(tr("не удалось открыть порт %1: %2")
+        emitWorkerEvent(tr("failed to open port %1: %2")
                             .arg(portName, errorText),
                         true);
         emit portStateChanged(false, portName, settingsDescription, false);
@@ -213,10 +259,10 @@ void RxWorker::openPort(const QString &portName,
 
     if (!configured)
     {
-        const QString errorText = m_serialPort->errorString();
+        const QString errorText = serialPortErrorText(m_serialPort->error());
         m_serialPort->close();
         m_openOperationInProgress = false;
-        emitWorkerEvent(tr("ошибка настройки порта %1: %2")
+        emitWorkerEvent(tr("failed to configure port %1: %2")
                             .arg(portName, errorText),
                         true);
         emit portStateChanged(false, portName, settingsDescription, false);
@@ -233,7 +279,7 @@ void RxWorker::openPort(const QString &portName,
                           m_openPortName,
                           m_openPortSettingsDescription,
                           false);
-    emitWorkerEvent(tr("порт %1 открыт: %2")
+    emitWorkerEvent(tr("port %1 opened: %2")
                         .arg(m_openPortName, m_openPortSettingsDescription),
                     false);
 }
@@ -258,8 +304,8 @@ void RxWorker::closePort()
     if (m_testRunning)
     {
         const QString reason =
-            tr("прием остановлен кнопкой CLOSE; принято %1 байт; "
-               "counter ok=%2; counter err=%3; неполный хвост=%4 байт")
+            tr("reception stopped by CLOSE; received %1 bytes; "
+               "counter ok=%2; counter err=%3; incomplete tail=%4 bytes")
                 .arg(m_totalBytesReceived)
                 .arg(m_counterOk)
                 .arg(m_counterErrors)
@@ -287,7 +333,7 @@ void RxWorker::closePort()
 
     if (!portName.trimmed().isEmpty())
     {
-        emitWorkerEvent(tr("порт %1 закрыт: %2")
+        emitWorkerEvent(tr("port %1 closed: %2")
                             .arg(portName, settingsText),
                         false);
     }
@@ -314,14 +360,14 @@ void RxWorker::startReception(int counterBits,
 {
     if (!m_initialized || m_serialPort == nullptr || !m_serialPort->isOpen())
     {
-        emitWorkerEvent(tr("START невозможен: COM-порт не открыт"), true);
+        emitWorkerEvent(tr("START failed: the COM port is not open"), true);
         emitReceptionState();
         return;
     }
 
     if (m_testRunning)
     {
-        emitWorkerEvent(tr("START невозможен: прием уже запущен"), true);
+        emitWorkerEvent(tr("START failed: reception is already running"), true);
         emitReceptionState();
         return;
     }
@@ -335,7 +381,7 @@ void RxWorker::startReception(int counterBits,
                              &settings,
                              &errorText))
     {
-        emitWorkerEvent(tr("ошибка Pattern: %1").arg(errorText), true);
+        emitWorkerEvent(tr("Pattern error: %1").arg(errorText), true);
         emitReceptionState();
         return;
     }
@@ -348,13 +394,13 @@ void RxWorker::startReception(int counterBits,
     emitReceptionState();
     m_statisticsTimer->start();
 
-    emitWorkerEvent(tr("START: прием и проверка запущены; %1")
+    emitWorkerEvent(tr("START: reception and verification started; %1")
                         .arg(patternDescription),
                     false);
 
     if (!discardedData.isEmpty())
     {
-        emitWorkerEvent(tr("START: отброшено %1 байт, принятых до запуска теста")
+        emitWorkerEvent(tr("START: discarded %1 bytes received before the test started")
                             .arg(discardedData.size()),
                         false);
     }
@@ -378,8 +424,8 @@ void RxWorker::stopReception()
     }
 
     const QString reason =
-        tr("STOP: прием и проверка остановлены; принято %1 байт; "
-           "counter ok=%2; counter err=%3; неполный хвост=%4 байт")
+        tr("STOP: reception and verification stopped; received %1 bytes; "
+           "counter ok=%2; counter err=%3; incomplete tail=%4 bytes")
             .arg(m_totalBytesReceived)
             .arg(m_counterOk)
             .arg(m_counterErrors)
@@ -426,8 +472,8 @@ void RxWorker::shutdown()
     if (m_testRunning)
     {
         const QString reason =
-            tr("прием остановлен при завершении программы; принято %1 байт; "
-               "counter ok=%2; counter err=%3; неполный хвост=%4 байт")
+            tr("reception stopped during application shutdown; received %1 bytes; "
+               "counter ok=%2; counter err=%3; incomplete tail=%4 bytes")
                 .arg(m_totalBytesReceived)
                 .arg(m_counterOk)
                 .arg(m_counterErrors)
@@ -447,7 +493,7 @@ void RxWorker::shutdown()
         m_openOperationInProgress = false;
 
         emit portStateChanged(false, portName, settingsText, false);
-        emitWorkerEvent(tr("порт %1 закрыт при завершении программы: %2")
+        emitWorkerEvent(tr("port %1 closed during application shutdown: %2")
                             .arg(portName, settingsText),
                         false);
     }
@@ -547,7 +593,7 @@ void RxWorker::checkPortHealth()
     }
 
     handlePortFailure(
-        tr("открытый порт %1 неожиданно закрылся").arg(m_openPortName));
+        tr("open port %1 closed unexpectedly").arg(m_openPortName));
 }
 
 /*-----------------------------------------------------------------------------*/
@@ -579,8 +625,8 @@ void RxWorker::handleSerialError(QSerialPort::SerialPortError error)
                                  ? m_serialPort->portName()
                                  : m_openPortName;
     const QString errorText =
-        tr("ошибка порта %1: %2 (код %3)")
-            .arg(portName, m_serialPort->errorString())
+        tr("port %1 error: %2 (code %3)")
+            .arg(portName, serialPortErrorText(error))
             .arg(static_cast<int>(error));
 
     const bool criticalError =
@@ -632,20 +678,20 @@ bool RxWorker::makePatternSettings(int counterBits,
         && counterBits != 32
         && counterBits != 64)
     {
-        *errorText = tr("counter, bits должен быть 8, 16, 32 или 64");
+        *errorText = tr("counter, bits must be 8, 16, 32, or 64");
         return false;
     }
 
     const int counterBytes = counterBits / 8;
     if (blockBytes <= 0 || (blockBytes % counterBytes) != 0)
     {
-        *errorText = tr("block, bytes должен быть положительным и кратным счетчику");
+        *errorText = tr("block, bytes must be positive and a multiple of the counter size");
         return false;
     }
 
     if (periodMs < 0)
     {
-        *errorText = tr("Period, ms не может быть отрицательным");
+        *errorText = tr("Period, ms cannot be negative");
         return false;
     }
 
@@ -656,7 +702,7 @@ bool RxWorker::makePatternSettings(int counterBits,
 
     if (initialValue > maximumCounterValue)
     {
-        *errorText = tr("init value не помещается в выбранную разрядность");
+        *errorText = tr("init value does not fit the selected counter width");
         return false;
     }
 
@@ -754,8 +800,8 @@ void RxWorker::processReceiveBuffer()
             }
 
             emitWorkerEvent(
-                tr("ошибка счетчика: ожидалось %1, принято %2, "
-                   "в следующий раз ожидается %3")
+                tr("counter error: expected %1, received %2, "
+                   "next expected value is %3")
                     .arg(expectedCounter)
                     .arg(receivedCounter)
                     .arg(nextExpectedCounter),
@@ -1022,8 +1068,8 @@ void RxWorker::handlePortFailure(const QString &reason)
     if (m_testRunning)
     {
         completeReason +=
-            tr("; прием остановлен; принято %1 байт; counter ok=%2; "
-               "counter err=%3; неполный хвост=%4 байт")
+            tr("; reception stopped; received %1 bytes; counter ok=%2; "
+               "counter err=%3; incomplete tail=%4 bytes")
                 .arg(m_totalBytesReceived)
                 .arg(m_counterOk)
                 .arg(m_counterErrors)

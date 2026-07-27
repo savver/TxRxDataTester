@@ -1,5 +1,5 @@
 # TxRxDataTester
-TxDataTester and RxDataTester generate, receive, and compare data patterns, such as continuous counters, for testing USB-UART, USB-RS-485, and UDP network connections.
+TxDataTester and RxDataTester generate, receive, and compare data patterns, such as continuous counters, for testing USB-UART(RS485), LAN-UART(RS485), and UDP network connections.
 
 ## Examples
 

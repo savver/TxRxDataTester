@@ -7,17 +7,17 @@
         <x>0</x>
         <y>0</y>
         <width>850</width>
-        <height>840</height>
+        <height>880</height>
       </rect>
     </property>
     <property name="minimumSize">
       <size>
         <width>780</width>
-        <height>760</height>
+        <height>790</height>
       </size>
     </property>
     <property name="windowTitle">
-      <string>RxDataTester (v.1.1)</string>
+      <string>RxDataTester (v.1.4)</string>
     </property>
     <widget class="QWidget" name="centralWidget">
       <layout class="QVBoxLayout" name="mainVerticalLayout">
@@ -836,41 +836,6 @@
                     </layout>
                   </widget>
                 </item>
-                <item>
-                  <widget class="QLabel" name="eventsLabel">
-                    <property name="text">
-                      <string>EVENTS</string>
-                    </property>
-                  </widget>
-                </item>
-                <item>
-                  <widget class="QPlainTextEdit" name="eventsPlainTextEdit">
-                    <property name="minimumSize">
-                      <size>
-                        <width>0</width>
-                        <height>150</height>
-                      </size>
-                    </property>
-                    <property name="focusPolicy">
-                      <enum>Qt::ClickFocus</enum>
-                    </property>
-                    <property name="undoRedoEnabled">
-                      <bool>false</bool>
-                    </property>
-                    <property name="lineWrapMode">
-                      <enum>QPlainTextEdit::NoWrap</enum>
-                    </property>
-                    <property name="readOnly">
-                      <bool>true</bool>
-                    </property>
-                    <property name="maximumBlockCount">
-                      <number>10000</number>
-                    </property>
-                    <property name="placeholderText">
-                      <string>Receiver event log</string>
-                    </property>
-                  </widget>
-                </item>
               </layout>
             </widget>
             <widget class="QWidget" name="udpTab">
@@ -878,15 +843,778 @@
                 <string>UDP</string>
               </attribute>
               <layout class="QVBoxLayout" name="udpTabVerticalLayout">
+                <property name="leftMargin">
+                  <number>10</number>
+                </property>
+                <property name="topMargin">
+                  <number>10</number>
+                </property>
+                <property name="rightMargin">
+                  <number>10</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>10</number>
+                </property>
+                <property name="spacing">
+                  <number>8</number>
+                </property>
                 <item>
-                  <spacer name="udpVerticalSpacer">
+                  <widget class="QGroupBox" name="udpConnectionGroupBox">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>145</height>
+                      </size>
+                    </property>
+                    <property name="title">
+                      <string>Connection</string>
+                    </property>
+                    <layout class="QGridLayout" name="udpConnectionGridLayout">
+                      <property name="horizontalSpacing">
+                        <number>10</number>
+                      </property>
+                      <property name="verticalSpacing">
+                        <number>10</number>
+                      </property>
+                      <item row="0" column="0">
+                        <widget class="QLabel" name="udpOurIpLabel">
+                          <property name="text">
+                            <string>our IP:</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="1" colspan="2">
+                        <widget class="QLabel" name="udpOurIpValueLabel">
+                          <property name="minimumSize">
+                            <size>
+                              <width>180</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="text">
+                            <string>--</string>
+                          </property>
+                          <property name="textInteractionFlags">
+                            <set>Qt::TextSelectableByMouse</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="3">
+                        <widget class="QLabel" name="udpOurMacLabel">
+                          <property name="text">
+                            <string>our MAC:</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="4" colspan="2">
+                        <widget class="QLabel" name="udpOurMacValueLabel">
+                          <property name="minimumSize">
+                            <size>
+                              <width>180</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="text">
+                            <string>--</string>
+                          </property>
+                          <property name="textInteractionFlags">
+                            <set>Qt::TextSelectableByMouse</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="0">
+                        <widget class="QLabel" name="udpDestinationIpLabel">
+                          <property name="text">
+                            <string>IP</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpDestinationIpLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="1">
+                        <widget class="QLineEdit" name="udpDestinationIpLineEdit">
+                          <property name="minimumSize">
+                            <size>
+                              <width>170</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="maxLength">
+                            <number>15</number>
+                          </property>
+                          <property name="placeholderText">
+                            <string>Destination IPv4 address</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="2">
+                        <spacer name="udpConnectionMiddleSpacer">
+                          <property name="orientation">
+                            <enum>Qt::Horizontal</enum>
+                          </property>
+                          <property name="sizeType">
+                            <enum>QSizePolicy::Fixed</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                            <size>
+                              <width>18</width>
+                              <height>20</height>
+                            </size>
+                          </property>
+                        </spacer>
+                      </item>
+                      <item row="1" column="3">
+                        <widget class="QLabel" name="udpDestinationPortLabel">
+                          <property name="text">
+                            <string>Port</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpDestinationPortLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="4">
+                        <widget class="QLineEdit" name="udpDestinationPortLineEdit">
+                          <property name="minimumSize">
+                            <size>
+                              <width>140</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="maxLength">
+                            <number>5</number>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                          <property name="placeholderText">
+                            <string>Destination port</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="5">
+                        <widget class="QPushButton" name="udpConnectButton">
+                          <property name="minimumSize">
+                            <size>
+                              <width>110</width>
+                              <height>34</height>
+                            </size>
+                          </property>
+                          <property name="text">
+                            <string>CONNECT</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="0">
+                        <widget class="QLabel" name="udpDestinationMacLabel">
+                          <property name="text">
+                            <string>dest MAC:</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="1" colspan="5">
+                        <widget class="QLabel" name="udpDestinationMacValueLabel">
+                          <property name="text">
+                            <string>--</string>
+                          </property>
+                          <property name="textInteractionFlags">
+                            <set>Qt::TextSelectableByMouse</set>
+                          </property>
+                        </widget>
+                      </item>
+                    </layout>
+                  </widget>
+                </item>
+                <item>
+                  <widget class="QGroupBox" name="udpPatternGroupBox">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>185</height>
+                      </size>
+                    </property>
+                    <property name="title">
+                      <string>Pattern</string>
+                    </property>
+                    <layout class="QGridLayout" name="udpPatternGridLayout">
+                      <property name="horizontalSpacing">
+                        <number>10</number>
+                      </property>
+                      <property name="verticalSpacing">
+                        <number>9</number>
+                      </property>
+                      <item row="0" column="0">
+                        <widget class="QLabel" name="udpCounterBitsLabel">
+                          <property name="text">
+                            <string>counter, bits</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpCounterBitsComboBox</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="1">
+                        <widget class="QComboBox" name="udpCounterBitsComboBox">
+                          <property name="minimumSize">
+                            <size>
+                              <width>110</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="currentIndex">
+                            <number>2</number>
+                          </property>
+                          <item>
+                            <property name="text">
+                              <string>8</string>
+                            </property>
+                          </item>
+                          <item>
+                            <property name="text">
+                              <string>16</string>
+                            </property>
+                          </item>
+                          <item>
+                            <property name="text">
+                              <string>32</string>
+                            </property>
+                          </item>
+                          <item>
+                            <property name="text">
+                              <string>64</string>
+                            </property>
+                          </item>
+                        </widget>
+                      </item>
+                      <item row="0" column="2">
+                        <spacer name="udpPatternMiddleSpacerTop">
+                          <property name="orientation">
+                            <enum>Qt::Horizontal</enum>
+                          </property>
+                          <property name="sizeType">
+                            <enum>QSizePolicy::Fixed</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                            <size>
+                              <width>18</width>
+                              <height>20</height>
+                            </size>
+                          </property>
+                        </spacer>
+                      </item>
+                      <item row="0" column="3">
+                        <widget class="QLabel" name="udpBlockBytesLabel">
+                          <property name="text">
+                            <string>block, bytes</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpBlockBytesLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="4">
+                        <widget class="QLineEdit" name="udpBlockBytesLineEdit">
+                          <property name="minimumSize">
+                            <size>
+                              <width>140</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="text">
+                            <string>128</string>
+                          </property>
+                          <property name="maxLength">
+                            <number>10</number>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                          <property name="placeholderText">
+                            <string>Block size</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="5">
+                        <widget class="QPushButton" name="udpStartButton">
+                          <property name="minimumSize">
+                            <size>
+                              <width>110</width>
+                              <height>34</height>
+                            </size>
+                          </property>
+                          <property name="enabled">
+                            <bool>false</bool>
+                          </property>
+                          <property name="text">
+                            <string>START</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="0">
+                        <widget class="QLabel" name="udpInitValueLabel">
+                          <property name="text">
+                            <string>init value</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpInitValueLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="1">
+                        <widget class="QLineEdit" name="udpInitValueLineEdit">
+                          <property name="text">
+                            <string>0</string>
+                          </property>
+                          <property name="maxLength">
+                            <number>20</number>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                          <property name="placeholderText">
+                            <string>0 or 0x...</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="2">
+                        <spacer name="udpPatternMiddleSpacerBottom">
+                          <property name="orientation">
+                            <enum>Qt::Horizontal</enum>
+                          </property>
+                          <property name="sizeType">
+                            <enum>QSizePolicy::Fixed</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                            <size>
+                              <width>18</width>
+                              <height>20</height>
+                            </size>
+                          </property>
+                        </spacer>
+                      </item>
+                      <item row="1" column="5">
+                        <widget class="QPushButton" name="udpStopButton">
+                          <property name="minimumSize">
+                            <size>
+                              <width>110</width>
+                              <height>34</height>
+                            </size>
+                          </property>
+                          <property name="enabled">
+                            <bool>false</bool>
+                          </property>
+                          <property name="text">
+                            <string>STOP</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="3">
+                        <widget class="QLabel" name="udpTogetherLabel">
+                          <property name="text">
+                            <string>Togeth</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpTogetherLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="4">
+                        <widget class="QLineEdit" name="udpTogetherLineEdit">
+                          <property name="minimumSize">
+                            <size>
+                              <width>140</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="text">
+                            <string>1</string>
+                          </property>
+                          <property name="maxLength">
+                            <number>10</number>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                          <property name="placeholderText">
+                            <string>Packets per burst</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="3">
+                        <widget class="QLabel" name="udpPeriodMsLabel">
+                          <property name="text">
+                            <string>Period, ms</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpPeriodMsLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="4">
+                        <widget class="QLineEdit" name="udpPeriodMsLineEdit">
+                          <property name="minimumSize">
+                            <size>
+                              <width>140</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="text">
+                            <string>100</string>
+                          </property>
+                          <property name="maxLength">
+                            <number>10</number>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                          <property name="placeholderText">
+                            <string>Period in ms</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="5">
+                        <spacer name="udpPatternRightBottomSpacer">
+                          <property name="orientation">
+                            <enum>Qt::Horizontal</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                            <size>
+                              <width>110</width>
+                              <height>20</height>
+                            </size>
+                          </property>
+                        </spacer>
+                      </item>
+                    </layout>
+                  </widget>
+                </item>
+                <item>
+                  <widget class="QGroupBox" name="udpStatisticsGroupBox">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>200</height>
+                      </size>
+                    </property>
+                    <property name="title">
+                      <string>Statistics</string>
+                    </property>
+                    <layout class="QGridLayout" name="udpStatisticsGridLayout">
+                      <property name="horizontalSpacing">
+                        <number>10</number>
+                      </property>
+                      <property name="verticalSpacing">
+                        <number>9</number>
+                      </property>
+                      <item row="0" column="0">
+                        <widget class="QLabel" name="udpStartTimeLabel">
+                          <property name="text">
+                            <string>start:</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="1">
+                        <widget class="QLabel" name="udpStartTimeValueLabel">
+                          <property name="text">
+                            <string>--:--:--</string>
+                          </property>
+                          <property name="minimumSize">
+                            <size>
+                              <width>115</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="2">
+                        <spacer name="udpStatisticsMiddleSpacerTop">
+                          <property name="orientation">
+                            <enum>Qt::Horizontal</enum>
+                          </property>
+                          <property name="sizeType">
+                            <enum>QSizePolicy::Fixed</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                            <size>
+                              <width>18</width>
+                              <height>20</height>
+                            </size>
+                          </property>
+                        </spacer>
+                      </item>
+                      <item row="0" column="3">
+                        <widget class="QLabel" name="udpRxBytesLabel">
+                          <property name="text">
+                            <string>rx, bytes</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpRxBytesLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="4">
+                        <widget class="QLineEdit" name="udpRxBytesLineEdit">
+                          <property name="minimumSize">
+                            <size>
+                              <width>160</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="focusPolicy">
+                            <enum>Qt::NoFocus</enum>
+                          </property>
+                          <property name="text">
+                            <string>0</string>
+                          </property>
+                          <property name="readOnly">
+                            <bool>true</bool>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="0">
+                        <widget class="QLabel" name="udpElapsedTimeLabel">
+                          <property name="text">
+                            <string>time:</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="1">
+                        <widget class="QLabel" name="udpElapsedTimeValueLabel">
+                          <property name="text">
+                            <string>00:00:00</string>
+                          </property>
+                          <property name="minimumSize">
+                            <size>
+                              <width>115</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="2">
+                        <spacer name="udpStatisticsMiddleSpacerCenter">
+                          <property name="orientation">
+                            <enum>Qt::Horizontal</enum>
+                          </property>
+                          <property name="sizeType">
+                            <enum>QSizePolicy::Fixed</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                            <size>
+                              <width>18</width>
+                              <height>20</height>
+                            </size>
+                          </property>
+                        </spacer>
+                      </item>
+                      <item row="1" column="3">
+                        <widget class="QLabel" name="udpCurrentCountLabel">
+                          <property name="text">
+                            <string>curr_count</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpCurrentCountLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="4">
+                        <widget class="QLineEdit" name="udpCurrentCountLineEdit">
+                          <property name="minimumSize">
+                            <size>
+                              <width>160</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="focusPolicy">
+                            <enum>Qt::NoFocus</enum>
+                          </property>
+                          <property name="text">
+                            <string>0</string>
+                          </property>
+                          <property name="readOnly">
+                            <bool>true</bool>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="0">
+                        <widget class="QLabel" name="udpCounterOkLabel">
+                          <property name="text">
+                            <string>counter, ok</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpCounterOkLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="1">
+                        <widget class="QLineEdit" name="udpCounterOkLineEdit">
+                          <property name="minimumSize">
+                            <size>
+                              <width>160</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="focusPolicy">
+                            <enum>Qt::NoFocus</enum>
+                          </property>
+                          <property name="text">
+                            <string>0</string>
+                          </property>
+                          <property name="readOnly">
+                            <bool>true</bool>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="2">
+                        <spacer name="udpStatisticsMiddleSpacerBottom">
+                          <property name="orientation">
+                            <enum>Qt::Horizontal</enum>
+                          </property>
+                          <property name="sizeType">
+                            <enum>QSizePolicy::Fixed</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                            <size>
+                              <width>18</width>
+                              <height>20</height>
+                            </size>
+                          </property>
+                        </spacer>
+                      </item>
+                      <item row="2" column="3">
+                        <widget class="QLabel" name="udpPacketsPerSecondLabel">
+                          <property name="text">
+                            <string>packets/s</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpPacketsPerSecondLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="4">
+                        <widget class="QLineEdit" name="udpPacketsPerSecondLineEdit">
+                          <property name="minimumSize">
+                            <size>
+                              <width>160</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="focusPolicy">
+                            <enum>Qt::NoFocus</enum>
+                          </property>
+                          <property name="text">
+                            <string>0</string>
+                          </property>
+                          <property name="readOnly">
+                            <bool>true</bool>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="3" column="0">
+                        <widget class="QLabel" name="udpCounterErrLabel">
+                          <property name="text">
+                            <string>counter, err</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpCounterErrLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="3" column="1">
+                        <widget class="QLineEdit" name="udpCounterErrLineEdit">
+                          <property name="minimumSize">
+                            <size>
+                              <width>160</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="focusPolicy">
+                            <enum>Qt::NoFocus</enum>
+                          </property>
+                          <property name="text">
+                            <string>0</string>
+                          </property>
+                          <property name="readOnly">
+                            <bool>true</bool>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="3" column="2">
+                        <spacer name="udpStatisticsMiddleSpacerLast">
+                          <property name="orientation">
+                            <enum>Qt::Horizontal</enum>
+                          </property>
+                          <property name="sizeType">
+                            <enum>QSizePolicy::Fixed</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                            <size>
+                              <width>18</width>
+                              <height>20</height>
+                            </size>
+                          </property>
+                        </spacer>
+                      </item>
+                      <item row="3" column="3">
+                        <widget class="QLabel" name="udpSpeedLabel">
+                          <property name="text">
+                            <string>speed, Kb/s</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>udpSpeedLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="3" column="4">
+                        <widget class="QLineEdit" name="udpSpeedLineEdit">
+                          <property name="minimumSize">
+                            <size>
+                              <width>160</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="focusPolicy">
+                            <enum>Qt::NoFocus</enum>
+                          </property>
+                          <property name="text">
+                            <string>0</string>
+                          </property>
+                          <property name="readOnly">
+                            <bool>true</bool>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                    </layout>
+                  </widget>
+                </item>
+                <item>
+                  <spacer name="udpBottomVerticalSpacer">
                     <property name="orientation">
                       <enum>Qt::Vertical</enum>
                     </property>
                     <property name="sizeHint" stdset="0">
                       <size>
                         <width>20</width>
-                        <height>400</height>
+                        <height>10</height>
                       </size>
                     </property>
                   </spacer>
@@ -895,9 +1623,46 @@
             </widget>
           </widget>
         </item>
+        <item>
+          <widget class="QLabel" name="eventsLabel">
+            <property name="text">
+              <string>EVENTS</string>
+            </property>
+          </widget>
+        </item>
+        <item>
+          <widget class="QPlainTextEdit" name="eventsPlainTextEdit">
+            <property name="minimumSize">
+              <size>
+                <width>0</width>
+                <height>150</height>
+              </size>
+            </property>
+            <property name="focusPolicy">
+              <enum>Qt::ClickFocus</enum>
+            </property>
+            <property name="undoRedoEnabled">
+              <bool>false</bool>
+            </property>
+            <property name="lineWrapMode">
+              <enum>QPlainTextEdit::NoWrap</enum>
+            </property>
+            <property name="readOnly">
+              <bool>true</bool>
+            </property>
+            <property name="maximumBlockCount">
+              <number>10000</number>
+            </property>
+            <property name="placeholderText">
+              <string>Event log</string>
+            </property>
+          </widget>
+        </item>
       </layout>
     </widget>
   </widget>
+  <resources />
+  <connections />
   <tabstops>
     <tabstop>tabWidget</tabstop>
     <tabstop>portComboBox</tabstop>
@@ -913,7 +1678,15 @@
     <tabstop>periodMsLineEdit</tabstop>
     <tabstop>stopButton</tabstop>
     <tabstop>eventsPlainTextEdit</tabstop>
+    <tabstop>udpDestinationIpLineEdit</tabstop>
+    <tabstop>udpDestinationPortLineEdit</tabstop>
+    <tabstop>udpConnectButton</tabstop>
+    <tabstop>udpCounterBitsComboBox</tabstop>
+    <tabstop>udpBlockBytesLineEdit</tabstop>
+    <tabstop>udpStartButton</tabstop>
+    <tabstop>udpInitValueLineEdit</tabstop>
+    <tabstop>udpTogetherLineEdit</tabstop>
+    <tabstop>udpPeriodMsLineEdit</tabstop>
+    <tabstop>udpStopButton</tabstop>
   </tabstops>
-  <resources/>
-  <connections/>
 </ui>

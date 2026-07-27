@@ -1,239 +1,228 @@
-# RxDataTester (v.1.1)
+# RxDataTester (v.1.4)
 
-Test-counter receiver for a serial COM port.
+RxDataTester is a Qt 5.12 + qmake utility that receives a binary counter
+pattern through COM or UDP and verifies that counter values increase
+continuously. The GUI, comments, EVENTS messages, and text logs are entirely in
+English.
 
-The project targets **Qt 5.12**, is built with **qmake**, and uses the
-`serialport` module. CMake is not used.
+## Version 1.4 fix
 
-## Version 1.1 changes
-
-- All application-generated EVENTS messages are in English.
-- All application-generated text-log messages are in English.
-- Serial-port and log-file errors use fixed English descriptions instead of localized system text.
-- All remaining UI helper text and tooltips are in English.
-- The README and Doxygen comments are in English.
-- Reception logic and the two-thread architecture are unchanged.
-
-## Project files
-
-```text
-RxDataTester.pro
-main.cpp
-mainwindow.h
-mainwindow.cpp
-mainwindow.ui
-rxworker.h
-rxworker.cpp
-```
+UDP datagrams are now consumed synchronously from the `QUdpSocket::readyRead`
+signal in the UDP RX worker thread. Version 1.3 deferred the actual read through
+a queued invocation; on Qt/Windows this could suppress subsequent `readyRead`
+notifications after the first datagram. Bounded queued continuations are still
+used only when more than one read batch remains pending, so STOP and Statistics
+remain responsive under a dense stream.
 
 ## Build
 
-Open `RxDataTester.pro` in Qt Creator with a Qt 5.12 kit, or run:
+Open `RxDataTester.pro` in Qt Creator configured for Qt 5.12, or build from a
+Qt command prompt:
 
 ```text
 qmake RxDataTester.pro
-make
+mingw32-make
 ```
 
-For an MSVC kit, run the normal build command provided by the selected Qt kit
-after `qmake`, such as `nmake` or `jom`.
+For an MSVC kit, use the corresponding `nmake` command. The project enables
+UTF-8 source handling for MSVC.
 
-## Thread architecture
-
-The application is split into two threads.
+Required Qt modules:
 
 ```text
-Main GUI thread
-├─ MainWindow and all widgets
-├─ OPEN / CLOSE / START / STOP buttons
-├─ QSerialPortInfo enumeration once per second
-├─ colored EVENTS view
-├─ text log and flush()
-└─ QSettings
-
-RX worker thread
-├─ RxWorker
-├─ QSerialPort
-├─ readyRead() handling
-├─ input QByteArray with an incomplete trailing value
-├─ little-endian counter decoding
-├─ comparison with the expected value
-├─ Statistics QTimer
-├─ port-state monitoring QTimer
-└─ speed and 20-second Statistics calculation
+core gui widgets network serialport
 ```
-
-The GUI never reads `QSerialPort` directly. All commands are sent to `RxWorker`
-through `Qt::QueuedConnection`; completed events and Statistics snapshots are
-sent back to the GUI. Repainting, moving, resizing, or minimizing the window
-does not stop serial-port reception.
-
-## Settings
-
-Supported settings:
-
-```text
-Baud:   115200, 230400, 460800, 921600, 1500000
-Data:   8 bits
-Parity: NONE, EVEN, ODD
-Stops:  1 or 2
-Flow:   NONE
-```
-
-While the port is closed, the COM-port list is refreshed once per second. Added
-and removed devices are recorded in EVENTS and the text log. While the port is
-open, the application monitors the selected device specifically.
-
-`OPEN` opens the port in `QIODevice::ReadOnly` mode. Port, Baud, Parity, and
-stops are locked until `CLOSE`.
-
-## Pattern
-
-```text
-counter, bits : 8, 16, 32, or 64
-block, bytes  : informational transmitter block size
-init value    : decimal or hexadecimal with the 0x prefix
-Period, ms    : informational transmitter block period
-block len, us : calculated UART transmission time for one block
-bo            : LE, little-endian
-```
-
-`block, bytes` is rounded upward to a multiple of the counter size. The
-`block, bytes` and `Period, ms` fields are retained to match TxDataTester
-settings, calculate `block len, us`, and describe the Pattern in the log.
-**Receiver parsing does not use block boundaries.**
-
-## Counter verification algorithm
-
-After `START`, the application discards data accumulated before the test and
-waits for new bytes. The stream is parsed continuously using only the selected
-counter size:
-
-```text
-8 bits  -> 1 byte
-16 bits -> 2 bytes
-32 bits -> 4 bytes
-64 bits -> 8 bytes
-```
-
-A `readyRead()` call may deliver any number of bytes. An incomplete trailing
-value of 1...7 bytes remains in the internal buffer until more data arrives.
-Every complete counter is decoded explicitly as little-endian, so the algorithm
-does not depend on host byte order or alignment.
-
-Example for `counter=32 bits`, `init value=10`:
-
-```text
-received 10 -> counter, ok + 1; next expected value is 11
-received 11 -> counter, ok + 1; next expected value is 12
-...
-```
-
-On a mismatch, `counter, err` is incremented once regardless of the numeric gap.
-The next expected value becomes the received value plus one:
-
-```text
-expected 120
-received 124
-counter, err + 1
-next expected value 125
-```
-
-A red line is written to EVENTS and the text log:
-
-```text
-19:44:06.361 - counter error: expected 120, received 124, next expected value is 125
-```
-
-After the maximum value, the unsigned counter wraps to zero. The algorithm
-assumes byte alignment is preserved. If a single byte inside a counter value is
-lost rather than a whole counter value, version 1.1 does not automatically scan
-for a new alignment boundary.
-
-## Statistics
-
-The following values are updated once per second:
-
-```text
-start:        local time when START was pressed
- time:        elapsed test time without a 24-hour wrap
-rx, bytes:    all bytes received after START
-curr_count:   last completely received counter value
-speed, Kb/s:  measured speed over the actual sample interval
-counter, ok:  number of matching counter values
-counter, err: number of mismatching counter values
-```
-
-Speed is calculated from received bytes and monotonic elapsed time:
-
-```text
-speed_Kb_s = delta_rx_bytes * 8 / delta_time_ms
-```
-
-Bits per millisecond are numerically equal to decimal kilobits per second.
-
-## EVENTS and colors
-
-Normal event format:
-
-```text
-HH:MM:SS.mmm - event
-```
-
-Colors:
-
-```text
-green - direct OPEN, CLOSE, START, or STOP button press
-red   - port, read, Pattern, and counter-mismatch errors
-black - application lifecycle, service information, and port open/close events
-```
-
-The EVENTS view uses a monospaced font, automatic scrolling, and a limit of
-10,000 visible lines. The text log has no line-count limit.
-
-## Log files
-
-On every launch, the application creates a directory next to the executable:
-
-```text
-logs
-```
-
-A new file is created with a name such as:
-
-```text
-rxdatatester_log__2026-07-22__19-44-06-361.txt
-```
-
-Every EVENTS line is duplicated in the UTF-8 file. In addition, a Statistics
-line is written only to the file once every 20 seconds, for example:
-
-```text
-19:44:26.361, time=00:00:20, rx_bytes=1782656, delta_rx_bytes=1782656, curr_counter=445689, counter_ok=445690, delta_counter_ok=445690, counter_err=0, delta_counter_err=0, min_speed=522, avrg_speed=544.18, max_speed=621
-```
-
-`avrg_speed` uses the exact measured interval. `min_speed` and `max_speed` are
-taken from the one-second speed samples shown in the GUI during that interval.
-
-## Saved settings
-
-On a normal shutdown, `QSettings` stores:
-
-```text
-window geometry
-selected COM port
-Baud, Parity, stops
-counter, bits
-block, bytes
-init value, including the 0x format
-Period, ms
-```
-
-The values are restored and validated again on the next launch.
 
 ## Source style
 
-Every function has an English Doxygen block with `@brief`, `@param`, `@return`,
-and `@detail`. Functions with no parameters use `@param none`; functions with
-no return value use `@return none`. Functions are separated by an 81-character
-`/*-----------------------------------------------------------------------------*/` line.
+Doxygen comments are placed before functions and use `@brief`, `@param`,
+`@return`, and `@detail`. Functions without parameters use `@param none`.
+Functions without a return value use `@return none`. Function implementations
+are separated with 81-character divider lines.
+
+## Thread architecture
+
+The application uses three event-loop threads:
+
+```text
+GUI thread
+|- widgets and tab locking
+|- EVENTS and text-log file
+|- QSettings
+|- COM-port discovery
+|- ping and neighbor-table lookup
+
+COM RX thread
+|- RxWorker
+|- QSerialPort and readyRead()
+|- COM stream reassembly
+|- counter verification
+|- COM Statistics
+
+UDP RX thread
+|- UdpRxWorker
+|- persistent bound QUdpSocket
+|- UDP datagram reading
+|- counter verification across datagrams
+|- UDP Statistics and 20-second log snapshots
+```
+
+GUI painting, window movement, and log-file flushing do not execute in the COM
+or UDP receiver threads.
+
+## COM tab
+
+The COM receiver retains the behavior of v.1.1:
+
+- available ports are refreshed once per second while the port is closed;
+- OPEN applies Port, Baud, Parity, and stop-bit settings;
+- START verifies a continuous little-endian counter stream;
+- incomplete counter fields are retained until more COM bytes arrive;
+- STOP ends verification but leaves the COM port open;
+- a mismatch increments `counter, err`, logs expected and received values, and
+  resynchronizes the next expected value to `received + 1`;
+- `counter, ok`, `rx, bytes`, `curr_count`, and `speed, Kb/s` are updated by the
+  COM worker.
+
+## UDP Connection
+
+The UDP Connection group contains:
+
+```text
+our IP: <local IPv4>       our MAC: <local interface MAC>
+IP [expected transmitter]  Port [local listening port]  CONNECT
+                               dest MAC: <transmitter MAC when resolvable>
+```
+
+`IP` is the IPv4 address of the expected transmitter. `Port` is the local UDP
+destination port on which RxDataTester binds and receives datagrams. The
+TxDataTester destination port must match this value. The transmitter source
+port is not required to match it.
+
+CONNECT performs these steps:
+
+1. Validate IPv4 and Port.
+2. Resolve the local interface selected by the operating-system route.
+3. Display `our IP` and `our MAC`.
+4. Send one short-timeout ping request.
+5. If ping succeeds, bind a persistent UDP socket to `our IP:Port`.
+6. Try to resolve `dest MAC` through the neighbor table.
+
+The receiver socket requests a 4 MiB operating-system receive buffer. The
+actual size may be adjusted by the operating system.
+
+A successful ping confirms IP reachability, not that the transmitter has
+started sending UDP data. START becomes available only after the UDP socket has
+been bound successfully.
+
+The COM and UDP modes are mutually exclusive:
+
+```text
+UDP CONNECT -> COM tab is disabled until DISCONNECT
+COM OPEN     -> UDP tab is disabled until CLOSE
+```
+
+## UDP Pattern and START
+
+UDP Pattern contains:
+
+- `counter, bits`: 8, 16, 32, or 64;
+- `block, bytes`: expected transmitter payload size and Pattern description;
+- `init value`: decimal or `0x`-prefixed hexadecimal;
+- `Togeth`: informational number of packets in one transmitter burst;
+- `Period, ms`: informational transmitter burst period;
+- START and STOP.
+
+When START is pressed, datagrams already queued before START are discarded.
+The expected counter is initialized from `init value`. Each accepted datagram
+from the configured source IP is decoded independently as a sequence of
+little-endian unsigned counter values. Counter continuity is preserved between
+adjacent UDP datagrams.
+
+For a 32-bit counter and a 128-byte payload, one datagram contains:
+
+```text
+128 / 4 = 32 counter values
+```
+
+Starting from decimal 10, the first packet therefore contains values 10 through
+41, and the next packet is expected to start with 42.
+
+For each value:
+
+```text
+received == expected
+    counter, ok += 1
+    next expected = received + 1
+
+received != expected
+    counter, err += 1
+    log expected, received, delta, and next_expected
+    next expected = received + 1
+```
+
+The selected counter wraps from its maximum value to zero. If a UDP payload is
+not divisible by the counter-field size, complete values are still checked and
+the trailing bytes are reported as a red payload-alignment error. Trailing bytes
+are not combined with the next datagram because UDP packet boundaries are
+preserved.
+
+Datagrams received from another source IP are ignored and reported once per
+unexpected source during the current test.
+
+## UDP Statistics
+
+UDP Statistics is updated approximately once per second using the actual
+monotonic interval:
+
+- `start`: wall-clock time when START was accepted;
+- `time`: elapsed time with unlimited hours;
+- `rx, bytes`: total accepted UDP payload bytes; network headers are excluded;
+- `curr_count`: last completely decoded counter value;
+- `packets/s`: accepted datagrams divided by the real interval;
+- `speed, Kb/s`: accepted payload bits divided by the real interval;
+- `counter, ok`: total matching counter values;
+- `counter, err`: total mismatching counter values.
+
+STOP records a final Statistics snapshot and leaves the bound UDP socket ready
+for another START. Datagrams received while the test is stopped are drained and
+ignored so stale data cannot enter the next test.
+
+## Twenty-second UDP log snapshot
+
+While UDP reception is active, an additional line is written only to the text
+log approximately every 20 seconds:
+
+```text
+19:44:06.361, time=00:00:20, rx_bytes=1782656, delta_rx_bytes=1782656, curr_counter=445689, counter_ok=445690, delta_counter_ok=445690, counter_err=0, delta_counter_err=0, min_packet/s=4078, avrg_packets/s=4352, max_packet/s=4788, min_speed_Kb/s=522, avrg_speed_Kb/s=544.18, max_speed_Kb/s=621
+```
+
+The minimum, average, and maximum packet rates and speeds are calculated from
+the one-second values displayed during the current 20-second interval. The
+average is the arithmetic mean of those samples. Delta counters are measured
+from the previous 20-second line.
+
+## EVENTS and text logs
+
+At startup the application creates a `logs` directory next to the executable
+and opens a new UTF-8 file named like:
+
+```text
+rxdatatester_log__YYYY-MM-DD__HH-MM-SS-mmm.txt
+```
+
+Every EVENTS line is duplicated to the text log. Direct button presses are
+green, errors are red, and service information is black. Worker events receive
+timestamps in the worker thread in `HH:MM:SS.mmm` format.
+
+A UDP counter mismatch is logged in this form:
+
+```text
+06:20:10.123 - UDP counter error: expected=33; received=63; delta=30; next_expected=64
+```
+
+## Saved settings
+
+QSettings stores window geometry, COM settings, COM Pattern, UDP IP and Port,
+and UDP Pattern values. COM and UDP connections are not restored automatically
+after restart; use OPEN or CONNECT again.

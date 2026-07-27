@@ -1,7 +1,9 @@
 #include "mainwindow.h"
 #include "rxworker.h"
+#include "udprxworker.h"
 #include "ui_mainwindow.h"
 
+#include <QAbstractSocket>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QCoreApplication>
@@ -11,10 +13,14 @@
 #include <QFileDevice>
 #include <QFont>
 #include <QFontDatabase>
+#include <QHostAddress>
 #include <QIODevice>
+#include <QNetworkAddressEntry>
+#include <QNetworkInterface>
 #include <QLineEdit>
 #include <QMetaObject>
 #include <QPlainTextEdit>
+#include <QProcess>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
@@ -24,12 +30,18 @@
 #include <QTextCharFormat>
 #include <QTextCursor>
 #include <QTextDocument>
+#include <QUdpSocket>
 
 #include <limits>
 
 namespace
 {
 constexpr int kPortRefreshIntervalMs = 1000;
+constexpr int kPingRequestCount = 1;
+constexpr int kPingReplyTimeoutMs = 500;
+constexpr int kPingProcessTimeoutMs = 1800;
+constexpr int kRouteProbeTimeoutMs = 1000;
+constexpr quint64 kMaximumIpv4UdpPayloadBytes = 65507;
 
 /**
  * @brief Returns a fixed English description for a file error.
@@ -76,6 +88,36 @@ QString fileErrorText(QFileDevice::FileError error)
 
     return QStringLiteral("unrecognized file error");
 }
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Returns a fixed English description for a process error.
+ * @param error QProcess error value to describe.
+ * @return English text that does not depend on the operating-system language.
+ * @detail Converts process-start and process-I/O failures used by ping and neighbor
+ *         lookup into concise EVENTS messages.
+ */
+QString processErrorText(QProcess::ProcessError error)
+{
+    switch (error)
+    {
+    case QProcess::FailedToStart:
+        return QStringLiteral("failed to start the process");
+    case QProcess::Crashed:
+        return QStringLiteral("the process crashed");
+    case QProcess::Timedout:
+        return QStringLiteral("the process operation timed out");
+    case QProcess::WriteError:
+        return QStringLiteral("process write error");
+    case QProcess::ReadError:
+        return QStringLiteral("process read error");
+    case QProcess::UnknownError:
+        return QStringLiteral("unknown process error");
+    }
+
+    return QStringLiteral("unrecognized process error");
+}
 }
 
 /*-----------------------------------------------------------------------------*/
@@ -85,20 +127,33 @@ QString fileErrorText(QFileDevice::FileError error)
  * @param parent Parent widget of the window.
  * @return none
  * @detail Configures the GUI, validators, event log, settings persistence, and the
- *         dedicated QThread that hosts RxWorker and all reception logic.
+ *         dedicated COM and UDP receiver worker threads.
  */
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
     , m_rxWorker(nullptr)
+    , m_udpRxWorker(nullptr)
+    , m_pingProcess(nullptr)
+    , m_neighborLookupProcess(nullptr)
     , m_portRefreshTimer(this)
+    , m_pingTimeoutTimer(this)
+    , m_udpDestinationPort(0)
     , m_workerReady(false)
+    , m_udpWorkerReady(false)
     , m_portOpen(false)
     , m_testRunning(false)
     , m_portOperationPending(false)
     , m_receptionCommandPending(false)
     , m_portLossRequestPending(false)
     , m_portSnapshotInitialized(false)
+    , m_udpConnected(false)
+    , m_udpConnectionOperationPending(false)
+    , m_udpTestRunning(false)
+    , m_udpReceptionCommandPending(false)
+    , m_udpDisconnectRequestedByUser(false)
+    , m_pingInProgress(false)
+    , m_neighborLookupInProgress(false)
     , m_shutdownPrepared(false)
 {
     ui->setupUi(this);
@@ -109,17 +164,40 @@ MainWindow::MainWindow(QWidget *parent)
     ui->patternGridLayout->setColumnStretch(4, 1);
     ui->statisticsGridLayout->setColumnStretch(1, 1);
     ui->statisticsGridLayout->setColumnStretch(4, 1);
+    ui->udpConnectionGridLayout->setColumnStretch(1, 1);
+    ui->udpConnectionGridLayout->setColumnStretch(4, 1);
+    ui->udpPatternGridLayout->setColumnStretch(1, 1);
+    ui->udpPatternGridLayout->setColumnStretch(4, 1);
+    ui->udpStatisticsGridLayout->setColumnStretch(1, 1);
+    ui->udpStatisticsGridLayout->setColumnStretch(4, 1);
 
     const QRegularExpression decimalExpression(QStringLiteral("[0-9]{0,10}"));
     ui->blockBytesLineEdit->setValidator(
         new QRegularExpressionValidator(decimalExpression, this));
     ui->periodMsLineEdit->setValidator(
         new QRegularExpressionValidator(decimalExpression, this));
+    ui->udpBlockBytesLineEdit->setValidator(
+        new QRegularExpressionValidator(decimalExpression, this));
+    ui->udpPeriodMsLineEdit->setValidator(
+        new QRegularExpressionValidator(decimalExpression, this));
+    ui->udpTogetherLineEdit->setValidator(
+        new QRegularExpressionValidator(decimalExpression, this));
 
     const QRegularExpression initialValueExpression(
         QStringLiteral("(?:0[xX][0-9A-Fa-f]{0,16}|[0-9]{0,20})"));
     ui->initValueLineEdit->setValidator(
         new QRegularExpressionValidator(initialValueExpression, this));
+    ui->udpInitValueLineEdit->setValidator(
+        new QRegularExpressionValidator(initialValueExpression, this));
+
+    const QRegularExpression ipv4CharacterExpression(
+        QStringLiteral("[0-9.]{0,15}"));
+    ui->udpDestinationIpLineEdit->setValidator(
+        new QRegularExpressionValidator(ipv4CharacterExpression, this));
+
+    const QRegularExpression udpPortExpression(QStringLiteral("[0-9]{0,5}"));
+    ui->udpDestinationPortLineEdit->setValidator(
+        new QRegularExpressionValidator(udpPortExpression, this));
 
     QFont eventsFont = QFontDatabase::systemFont(QFontDatabase::FixedFont);
     eventsFont.setPointSize(10);
@@ -195,9 +273,98 @@ MainWindow::MainWindow(QWidget *parent)
             &QPushButton::clicked,
             this,
             &MainWindow::stopTest);
+    connect(ui->udpBlockBytesLineEdit,
+            &QLineEdit::editingFinished,
+            this,
+            &MainWindow::normalizeUdpBlockSize);
+    connect(ui->udpInitValueLineEdit,
+            &QLineEdit::editingFinished,
+            this,
+            &MainWindow::normalizeUdpInitialValue);
+    connect(ui->udpPeriodMsLineEdit,
+            &QLineEdit::editingFinished,
+            this,
+            &MainWindow::normalizeUdpPeriod);
+    connect(ui->udpTogetherLineEdit,
+            &QLineEdit::editingFinished,
+            this,
+            &MainWindow::normalizeUdpTogether);
+    connect(ui->udpCounterBitsComboBox,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this,
+            &MainWindow::handleUdpCounterBitsChanged);
+    connect(ui->udpConnectButton,
+            &QPushButton::clicked,
+            this,
+            &MainWindow::handleUdpConnectButton);
+    connect(ui->udpStartButton,
+            &QPushButton::clicked,
+            this,
+            &MainWindow::startUdpTest);
+    connect(ui->udpStopButton,
+            &QPushButton::clicked,
+            this,
+            &MainWindow::stopUdpTest);
+    connect(ui->udpDestinationIpLineEdit,
+            &QLineEdit::textChanged,
+            this,
+            [this](const QString &)
+            {
+                if (!m_udpConnected
+                    && !m_pingInProgress
+                    && !m_neighborLookupInProgress
+                    && !m_udpConnectionOperationPending)
+                {
+                    clearUdpNetworkInformation();
+                }
+                updateControlStates();
+            });
+    connect(ui->udpDestinationPortLineEdit,
+            &QLineEdit::textChanged,
+            this,
+            [this](const QString &)
+            {
+                if (!m_udpConnected
+                    && !m_pingInProgress
+                    && !m_neighborLookupInProgress
+                    && !m_udpConnectionOperationPending)
+                {
+                    clearUdpNetworkInformation();
+                }
+                updateControlStates();
+            });
+
+    m_pingTimeoutTimer.setSingleShot(true);
+    m_pingTimeoutTimer.setTimerType(Qt::PreciseTimer);
+    connect(&m_pingTimeoutTimer,
+            &QTimer::timeout,
+            this,
+            &MainWindow::handlePingTimeout);
+
+    m_pingProcess = new QProcess(this);
+    m_pingProcess->setProcessChannelMode(QProcess::MergedChannels);
+    connect(m_pingProcess,
+            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this,
+            &MainWindow::handlePingFinished);
+    connect(m_pingProcess,
+            &QProcess::errorOccurred,
+            this,
+            &MainWindow::handlePingProcessError);
+
+    m_neighborLookupProcess = new QProcess(this);
+    m_neighborLookupProcess->setProcessChannelMode(QProcess::MergedChannels);
+    connect(m_neighborLookupProcess,
+            QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this,
+            &MainWindow::handleNeighborLookupFinished);
+    connect(m_neighborLookupProcess,
+            &QProcess::errorOccurred,
+            this,
+            &MainWindow::handleNeighborLookupProcessError);
 
     initializeLogFile();
-    appendEvent(tr("RxDataTester (v.1.1) started"), EventType::Normal);
+    appendEvent(tr("RxDataTester (v.1.4) started"), EventType::Normal);
 
     if (m_logFile.isOpen())
     {
@@ -211,6 +378,11 @@ MainWindow::MainWindow(QWidget *parent)
     normalizeInitialValue();
     normalizePeriod();
     updateBlockTransmissionTime();
+    normalizeUdpBlockSize();
+    normalizeUdpInitialValue();
+    normalizeUdpTogether();
+    normalizeUdpPeriod();
+    clearUdpNetworkInformation();
 
     ui->startTimeValueLabel->setText(QStringLiteral("--:--:--"));
     ui->elapsedTimeValueLabel->setText(QStringLiteral("00:00:00"));
@@ -223,7 +395,20 @@ MainWindow::MainWindow(QWidget *parent)
     parseInitialValue(&initialValue);
     ui->currentCountLineEdit->setText(QString::number(initialValue));
 
+    ui->udpStartTimeValueLabel->setText(QStringLiteral("--:--:--"));
+    ui->udpElapsedTimeValueLabel->setText(QStringLiteral("00:00:00"));
+    ui->udpRxBytesLineEdit->setText(QStringLiteral("0"));
+    ui->udpPacketsPerSecondLineEdit->setText(QStringLiteral("0"));
+    ui->udpSpeedLineEdit->setText(QStringLiteral("0"));
+    ui->udpCounterOkLineEdit->setText(QStringLiteral("0"));
+    ui->udpCounterErrLineEdit->setText(QStringLiteral("0"));
+
+    quint64 udpInitialValue = 0;
+    parseUdpInitialValue(&udpInitialValue);
+    ui->udpCurrentCountLineEdit->setText(QString::number(udpInitialValue));
+
     initializeRxThread();
+    initializeUdpRxThread();
     refreshSerialPorts();
     updateControlStates();
     m_portRefreshTimer.start();
@@ -235,8 +420,8 @@ MainWindow::MainWindow(QWidget *parent)
  * @brief Destroys the main application window.
  * @param none
  * @return none
- * @detail Ensures orderly shutdown of the RX thread, closes the log file, and releases
- *         the Qt Designer user interface.
+ * @detail Ensures orderly shutdown of both receiver threads, closes the log file, and
+ *         releases the Qt Designer user interface.
  */
 MainWindow::~MainWindow()
 {
@@ -254,8 +439,8 @@ MainWindow::~MainWindow()
  * @brief Handles closing of the main window.
  * @param event Qt close event for the window.
  * @return none
- * @detail Synchronously stops the RX thread, saves the settings, closes the log, and
- *         then passes the event to the base QMainWindow implementation.
+ * @detail Synchronously stops both receiver threads, saves the settings, closes the
+ *         log, and then passes the event to the base QMainWindow implementation.
  */
 void MainWindow::closeEvent(QCloseEvent *event)
 {
@@ -356,6 +541,16 @@ void MainWindow::openSerialPort()
     }
 
     appendEvent(tr("OPEN button pressed"), EventType::Action);
+
+    if (m_udpConnected
+        || m_pingInProgress
+        || m_neighborLookupInProgress
+        || m_udpConnectionOperationPending)
+    {
+        appendEvent(tr("open error: disconnect the UDP destination before opening a COM port"),
+                    EventType::Error);
+        return;
+    }
 
     if (!m_workerReady || m_portOpen || m_rxWorker == nullptr)
     {
@@ -652,6 +847,611 @@ void MainWindow::stopTest()
 /*-----------------------------------------------------------------------------*/
 
 /**
+ * @brief Normalizes the UDP informational block size.
+ * @param none
+ * @return none
+ * @detail Rounds block, bytes upward to a multiple of the selected UDP counter size
+ *         and clamps it to the IPv4 UDP payload limit.
+ */
+void MainWindow::normalizeUdpBlockSize()
+{
+    const quint64 alignment = udpCounterBytes();
+    const quint64 maximumAligned =
+        kMaximumIpv4UdpPayloadBytes - (kMaximumIpv4UdpPayloadBytes % alignment);
+
+    bool conversionOk = false;
+    quint64 blockSize =
+        ui->udpBlockBytesLineEdit->text().trimmed().toULongLong(
+            &conversionOk,
+            10);
+
+    if (!conversionOk || blockSize == 0)
+    {
+        blockSize = alignment;
+    }
+
+    if (blockSize > maximumAligned)
+    {
+        blockSize = maximumAligned;
+    }
+    else if ((blockSize % alignment) != 0)
+    {
+        blockSize = ((blockSize + alignment - 1U) / alignment) * alignment;
+    }
+
+    ui->udpBlockBytesLineEdit->setText(QString::number(blockSize));
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Validates the UDP initial counter value.
+ * @param none
+ * @return none
+ * @detail Accepts decimal and 0x-prefixed hexadecimal input and mirrors the normalized
+ *         value in the UDP curr_count field.
+ */
+void MainWindow::normalizeUdpInitialValue()
+{
+    const QString originalText = ui->udpInitValueLineEdit->text().trimmed();
+    const bool hexadecimal =
+        originalText.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive);
+
+    quint64 value = 0;
+    if (!parseUdpInitialValue(&value))
+    {
+        ui->udpInitValueLineEdit->setText(QStringLiteral("0"));
+        ui->udpCurrentCountLineEdit->setText(QStringLiteral("0"));
+        return;
+    }
+
+    if (hexadecimal)
+    {
+        ui->udpInitValueLineEdit->setText(
+            QStringLiteral("0x") + QString::number(value, 16).toUpper());
+    }
+    else
+    {
+        ui->udpInitValueLineEdit->setText(QString::number(value));
+    }
+
+    ui->udpCurrentCountLineEdit->setText(QString::number(value));
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Normalizes the UDP informational packet period.
+ * @param none
+ * @return none
+ * @detail Converts an empty field to zero and clamps values above the maximum QTimer
+ *         interval representable by int.
+ */
+void MainWindow::normalizeUdpPeriod()
+{
+    bool conversionOk = false;
+    quint64 period =
+        ui->udpPeriodMsLineEdit->text().trimmed().toULongLong(
+            &conversionOk,
+            10);
+
+    if (!conversionOk)
+    {
+        period = 0;
+    }
+
+    const quint64 maximumPeriod =
+        static_cast<quint64>(std::numeric_limits<int>::max());
+    if (period > maximumPeriod)
+    {
+        period = maximumPeriod;
+    }
+
+    ui->udpPeriodMsLineEdit->setText(QString::number(period));
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Normalizes the UDP Togeth packet count.
+ * @param none
+ * @return none
+ * @detail Converts empty or zero input to one and clamps values to int range.
+ */
+void MainWindow::normalizeUdpTogether()
+{
+    bool conversionOk = false;
+    quint64 togetherCount =
+        ui->udpTogetherLineEdit->text().trimmed().toULongLong(
+            &conversionOk,
+            10);
+
+    if (!conversionOk || togetherCount == 0)
+    {
+        togetherCount = 1;
+    }
+
+    const quint64 maximumTogether =
+        static_cast<quint64>(std::numeric_limits<int>::max());
+    if (togetherCount > maximumTogether)
+    {
+        togetherCount = maximumTogether;
+    }
+
+    ui->udpTogetherLineEdit->setText(QString::number(togetherCount));
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Handles a change of the UDP counter width.
+ * @param none
+ * @return none
+ * @detail Realigns UDP block, bytes and validates the UDP init value range again.
+ */
+void MainWindow::handleUdpCounterBitsChanged()
+{
+    normalizeUdpBlockSize();
+    normalizeUdpInitialValue();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Connects or disconnects the UDP receiver endpoint.
+ * @param none
+ * @return none
+ * @detail CONNECT validates the transmitter IP and local listening Port, resolves the
+ *         local interface, runs one short-timeout ping, and then binds the receiver
+ *         socket. DISCONNECT closes the socket in UdpRxWorker.
+ */
+void MainWindow::handleUdpConnectButton()
+{
+    if (m_shutdownPrepared
+        || m_pingInProgress
+        || m_udpConnectionOperationPending
+        || m_udpReceptionCommandPending)
+    {
+        return;
+    }
+
+    if (m_udpConnected)
+    {
+        if (!m_udpWorkerReady
+            || m_udpRxWorker == nullptr
+            || m_udpTestRunning)
+        {
+            updateControlStates();
+            return;
+        }
+
+        appendEvent(tr("DISCONNECT button pressed"), EventType::Action);
+
+        if (m_neighborLookupProcess != nullptr
+            && m_neighborLookupProcess->state() != QProcess::NotRunning)
+        {
+            m_neighborLookupInProgress = false;
+            m_neighborLookupProcess->kill();
+            m_neighborLookupProcess->waitForFinished(100);
+            m_neighborLookupProcess->readAll();
+        }
+
+        m_udpConnectionOperationPending = true;
+        m_udpDisconnectRequestedByUser = true;
+        updateControlStates();
+        emit disconnectUdpConnectionRequested();
+        return;
+    }
+
+    if (m_portOpen
+        || m_portOperationPending
+        || m_testRunning
+        || m_receptionCommandPending)
+    {
+        appendEvent(tr("UDP Connection error: close the COM port before CONNECT"),
+                    EventType::Error);
+        return;
+    }
+
+    appendEvent(tr("CONNECT button pressed"), EventType::Action);
+
+    QString destinationIp;
+    quint16 destinationPort = 0;
+    QString errorText;
+    if (!readUdpDestination(&destinationIp,
+                            &destinationPort,
+                            &errorText))
+    {
+        appendEvent(tr("UDP Connection error: %1").arg(errorText),
+                    EventType::Error);
+        return;
+    }
+
+    QString localIp;
+    QString localMac;
+    if (!resolveUdpRoute(destinationIp,
+                         destinationPort,
+                         &localIp,
+                         &localMac,
+                         &errorText))
+    {
+        appendEvent(tr("UDP Connection error: %1").arg(errorText),
+                    EventType::Error);
+        return;
+    }
+
+    m_udpDestinationIp = destinationIp;
+    m_udpDestinationPort = destinationPort;
+    m_udpOurIp = localIp;
+    m_udpOurMac = localMac;
+    m_udpDestinationMac.clear();
+    ui->udpOurIpValueLabel->setText(m_udpOurIp);
+    ui->udpOurMacValueLabel->setText(m_udpOurMac);
+    ui->udpDestinationMacValueLabel->setText(QStringLiteral("--"));
+
+    appendEvent(udpConnectionDescription(destinationIp, destinationPort),
+                EventType::Normal);
+    startUdpPing(destinationIp);
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Requests start of UDP reception and counter verification.
+ * @param none
+ * @return none
+ * @detail Logs the UDP START button press in green, validates Pattern, and sends the
+ *         command to the dedicated UDP RX worker thread.
+ */
+void MainWindow::startUdpTest()
+{
+    if (m_udpReceptionCommandPending || m_shutdownPrepared)
+    {
+        return;
+    }
+
+    appendEvent(tr("UDP START button pressed"), EventType::Action);
+
+    if (!m_udpWorkerReady
+        || !m_udpConnected
+        || m_udpRxWorker == nullptr)
+    {
+        appendEvent(tr("UDP START failed: the receiver socket is not connected"),
+                    EventType::Error);
+        return;
+    }
+
+    if (m_udpTestRunning)
+    {
+        appendEvent(tr("UDP START failed: reception is already active"),
+                    EventType::Error);
+        return;
+    }
+
+    normalizeUdpBlockSize();
+    normalizeUdpInitialValue();
+    normalizeUdpTogether();
+    normalizeUdpPeriod();
+
+    UdpPatternSettings settings;
+    QString errorText;
+    if (!readUdpPatternSettings(&settings, &errorText))
+    {
+        appendEvent(tr("UDP Pattern error: %1").arg(errorText),
+                    EventType::Error);
+        return;
+    }
+
+    m_udpReceptionCommandPending = true;
+    updateControlStates();
+    emit startUdpReceptionRequested(settings.counterBits,
+                                    settings.blockBytes,
+                                    settings.togetherCount,
+                                    settings.periodMs,
+                                    settings.initialValue,
+                                    udpPatternDescription(settings));
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Requests stop of UDP reception and counter verification.
+ * @param none
+ * @return none
+ * @detail Logs the UDP STOP button press in green and sends a queued STOP command to
+ *         UdpRxWorker while leaving the receiver socket bound.
+ */
+void MainWindow::stopUdpTest()
+{
+    if (!m_udpWorkerReady
+        || !m_udpTestRunning
+        || m_udpReceptionCommandPending
+        || m_udpRxWorker == nullptr
+        || m_shutdownPrepared)
+    {
+        updateControlStates();
+        return;
+    }
+
+    appendEvent(tr("UDP STOP button pressed"), EventType::Action);
+    m_udpReceptionCommandPending = true;
+    updateControlStates();
+    emit stopUdpReceptionRequested();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Starts an asynchronous one-request IPv4 ping.
+ * @param destinationIp Validated destination IPv4 address.
+ * @return none
+ * @detail Uses a short native timeout and records only fixed English result text.
+ */
+void MainWindow::startUdpPing(const QString &destinationIp)
+{
+    if (m_pingProcess == nullptr
+        || m_pingProcess->state() != QProcess::NotRunning)
+    {
+        appendEvent(tr("PING process is already running"), EventType::Error);
+        return;
+    }
+
+    m_pingDestinationIp = destinationIp;
+    m_pingInProgress = true;
+    m_udpConnectionOperationPending = true;
+    updateControlStates();
+
+    QString program = QStringLiteral("ping");
+    QStringList arguments;
+#ifdef Q_OS_WIN
+    arguments << QStringLiteral("-4")
+              << QStringLiteral("-n")
+              << QString::number(kPingRequestCount)
+              << QStringLiteral("-w")
+              << QString::number(kPingReplyTimeoutMs)
+              << destinationIp;
+#elif defined(Q_OS_MACOS)
+    arguments << QStringLiteral("-c")
+              << QString::number(kPingRequestCount)
+              << QStringLiteral("-W")
+              << QString::number(kPingReplyTimeoutMs)
+              << destinationIp;
+#else
+    arguments << QStringLiteral("-4")
+              << QStringLiteral("-c")
+              << QString::number(kPingRequestCount)
+              << QStringLiteral("-W")
+              << QStringLiteral("1")
+              << destinationIp;
+#endif
+
+    appendEvent(tr("PING started: dest_IP=%1; requests=%2; reply_timeout=%3 ms")
+                    .arg(destinationIp)
+                    .arg(kPingRequestCount)
+                    .arg(kPingReplyTimeoutMs),
+                EventType::Normal);
+    m_pingProcess->start(program, arguments);
+    m_pingTimeoutTimer.start(kPingProcessTimeoutMs);
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Handles completion of the ping utility.
+ * @param exitCode Process exit code.
+ * @param exitStatus QProcess::ExitStatus value.
+ * @return none
+ * @detail Counts replies, logs a fixed English result, and requests creation of the
+ *         persistent UDP receiver socket when the target is reachable.
+ */
+void MainWindow::handlePingFinished(int exitCode, QProcess::ExitStatus exitStatus)
+{
+    Q_UNUSED(exitCode);
+
+    if (!m_pingInProgress || m_pingProcess == nullptr)
+    {
+        return;
+    }
+
+    m_pingTimeoutTimer.stop();
+    m_pingInProgress = false;
+    const QString output =
+        QString::fromLocal8Bit(m_pingProcess->readAll());
+    const int replies = qMin(kPingRequestCount, pingReplyCount(output));
+    const bool normalExit = exitStatus == QProcess::NormalExit;
+    const bool reachable = normalExit && replies > 0;
+
+    if (replies == kPingRequestCount)
+    {
+        appendEvent(tr("PING result: dest_IP=%1; replies=%2/%3; packet_loss=0%")
+                        .arg(m_pingDestinationIp)
+                        .arg(replies)
+                        .arg(kPingRequestCount),
+                    EventType::Normal);
+    }
+    else if (replies > 0)
+    {
+        const int packetLoss =
+            ((kPingRequestCount - replies) * 100) / kPingRequestCount;
+        appendEvent(tr("PING result: dest_IP=%1; replies=%2/%3; packet_loss=%4%")
+                        .arg(m_pingDestinationIp)
+                        .arg(replies)
+                        .arg(kPingRequestCount)
+                        .arg(packetLoss),
+                    EventType::Error);
+    }
+    else
+    {
+        appendEvent(tr("PING result: dest_IP=%1; replies=0/%2; destination is unreachable")
+                        .arg(m_pingDestinationIp)
+                        .arg(kPingRequestCount),
+                    EventType::Error);
+    }
+
+    if (reachable)
+    {
+        if (!m_udpWorkerReady || m_udpRxWorker == nullptr)
+        {
+            m_udpConnectionOperationPending = false;
+            setUdpConnectionState(false);
+            appendEvent(tr("UDP Connection error: the UDP RX worker thread is not ready"),
+                        EventType::Error);
+            return;
+        }
+
+        startDestinationMacLookup(m_pingDestinationIp);
+        m_udpConnectionOperationPending = true;
+        m_udpDisconnectRequestedByUser = false;
+        updateControlStates();
+        emit configureUdpConnectionRequested(m_udpDestinationIp,
+                                             m_udpDestinationPort,
+                                             m_udpOurIp);
+    }
+    else
+    {
+        m_udpConnectionOperationPending = false;
+        setUdpConnectionState(false);
+        m_udpDestinationMac.clear();
+        ui->udpDestinationMacValueLabel->setText(QStringLiteral("--"));
+        updateControlStates();
+    }
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Handles an asynchronous ping-process error.
+ * @param processError QProcess::ProcessError value.
+ * @return none
+ * @detail Reports a fixed English diagnostic and unlocks the destination fields.
+ */
+void MainWindow::handlePingProcessError(QProcess::ProcessError processError)
+{
+    if (!m_pingInProgress)
+    {
+        return;
+    }
+
+    m_pingTimeoutTimer.stop();
+    m_pingInProgress = false;
+    m_udpConnectionOperationPending = false;
+    setUdpConnectionState(false);
+    m_udpDestinationMac.clear();
+    ui->udpDestinationMacValueLabel->setText(QStringLiteral("--"));
+    appendEvent(tr("PING process error for %1: %2")
+                    .arg(m_pingDestinationIp,
+                         processErrorText(processError)),
+                EventType::Error);
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Handles expiration of the application-level ping watchdog.
+ * @param none
+ * @return none
+ * @detail Terminates a ping process that exceeded the short connection timeout.
+ */
+void MainWindow::handlePingTimeout()
+{
+    if (!m_pingInProgress || m_pingProcess == nullptr)
+    {
+        return;
+    }
+
+    m_pingInProgress = false;
+    m_udpConnectionOperationPending = false;
+    if (m_pingProcess->state() != QProcess::NotRunning)
+    {
+        m_pingProcess->kill();
+        m_pingProcess->waitForFinished(100);
+        m_pingProcess->readAll();
+    }
+
+    setUdpConnectionState(false);
+    m_udpDestinationMac.clear();
+    ui->udpDestinationMacValueLabel->setText(QStringLiteral("--"));
+    appendEvent(tr("PING timeout: dest_IP=%1; process_timeout=%2 ms")
+                    .arg(m_pingDestinationIp)
+                    .arg(kPingProcessTimeoutMs),
+                EventType::Error);
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Handles completion of the neighbor-table lookup.
+ * @param exitCode Process exit code.
+ * @param exitStatus QProcess::ExitStatus value.
+ * @return none
+ * @detail Extracts the target MAC address from numeric process output.
+ */
+void MainWindow::handleNeighborLookupFinished(int exitCode, QProcess::ExitStatus exitStatus)
+{
+    Q_UNUSED(exitCode);
+    Q_UNUSED(exitStatus);
+
+    if (!m_neighborLookupInProgress || m_neighborLookupProcess == nullptr)
+    {
+        return;
+    }
+
+    m_neighborLookupInProgress = false;
+    const QString output =
+        QString::fromLocal8Bit(m_neighborLookupProcess->readAll());
+    const QString macAddress =
+        parseDestinationMac(output, m_neighborLookupIp);
+
+    if (!macAddress.isEmpty())
+    {
+        m_udpDestinationMac = macAddress;
+        ui->udpDestinationMacValueLabel->setText(m_udpDestinationMac);
+        appendEvent(tr("destination MAC resolved: dest_IP=%1; dest_MAC=%2")
+                        .arg(m_neighborLookupIp, m_udpDestinationMac),
+                    EventType::Normal);
+    }
+    else
+    {
+        m_udpDestinationMac.clear();
+        ui->udpDestinationMacValueLabel->setText(QStringLiteral("--"));
+        appendEvent(tr("destination MAC is unavailable for %1; the target may be outside the local subnet or absent from the neighbor table")
+                        .arg(m_neighborLookupIp),
+                    EventType::Normal);
+    }
+
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Handles an asynchronous neighbor-table process error.
+ * @param processError QProcess::ProcessError value.
+ * @return none
+ * @detail Keeps the logical connection and records a fixed English diagnostic.
+ */
+void MainWindow::handleNeighborLookupProcessError(QProcess::ProcessError processError)
+{
+    if (!m_neighborLookupInProgress)
+    {
+        return;
+    }
+
+    m_neighborLookupInProgress = false;
+    m_udpDestinationMac.clear();
+    ui->udpDestinationMacValueLabel->setText(QStringLiteral("--"));
+    appendEvent(tr("destination MAC lookup error for %1: %2")
+                    .arg(m_neighborLookupIp,
+                         processErrorText(processError)),
+                EventType::Error);
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
  * @brief Handles readiness of the dedicated RX worker thread.
  * @param none
  * @return none
@@ -671,12 +1471,13 @@ void MainWindow::handleWorkerReady()
 /*-----------------------------------------------------------------------------*/
 
 /**
- * @brief Receives a normal or error event from RxWorker.
+ * @brief Receives a normal or error event from a receiver worker.
  * @param timestamp Timestamp created in the worker thread.
  * @param text Event text without a timestamp.
  * @param error true for a red error entry; otherwise false.
  * @return none
- * @detail Displays the event in EVENTS and duplicates it to the log in the GUI thread.
+ * @detail Displays COM or UDP worker events in EVENTS and duplicates them to the text
+ *         log in the GUI thread.
  */
 void MainWindow::handleWorkerEvent(const QString &timestamp,
                                    const QString &text,
@@ -796,6 +1597,139 @@ void MainWindow::handleStatisticsUpdated(const QString &startTime,
 /*-----------------------------------------------------------------------------*/
 
 /**
+ * @brief Handles readiness of the dedicated UDP RX worker thread.
+ * @param none
+ * @return none
+ * @detail Enables UDP controls after QUdpSocket and the Statistics timer are created in
+ *         the worker thread.
+ */
+void MainWindow::handleUdpWorkerReady()
+{
+    if (m_shutdownPrepared)
+    {
+        return;
+    }
+
+    m_udpWorkerReady = true;
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Receives the persistent UDP receiver-socket state.
+ * @param connected true when the socket is bound and ready to receive.
+ * @param expectedSourceIp Configured IPv4 address of the expected transmitter.
+ * @param listenPort Local UDP port reserved for reception.
+ * @param localIp Local IPv4 address to which the socket is bound.
+ * @param causedByFailure true when the socket was closed because of an error.
+ * @return none
+ * @detail Synchronizes CONNECT, tab locking, and UDP controls without accessing
+ *         QUdpSocket from the GUI thread.
+ */
+void MainWindow::handleUdpConnectionStateChanged(
+    bool connected,
+    const QString &expectedSourceIp,
+    quint16 listenPort,
+    const QString &localIp,
+    bool causedByFailure)
+{
+    const bool userDisconnect = m_udpDisconnectRequestedByUser;
+    m_udpConnectionOperationPending = false;
+    m_udpDisconnectRequestedByUser = false;
+    setUdpConnectionState(connected);
+
+    if (connected)
+    {
+        m_udpDestinationIp = expectedSourceIp;
+        m_udpDestinationPort = listenPort;
+        m_udpOurIp = localIp;
+        ui->udpOurIpValueLabel->setText(m_udpOurIp);
+    }
+    else
+    {
+        m_udpTestRunning = false;
+        m_udpReceptionCommandPending = false;
+
+        if (userDisconnect || causedByFailure)
+        {
+            if (m_neighborLookupProcess != nullptr
+                && m_neighborLookupProcess->state() != QProcess::NotRunning)
+            {
+                m_neighborLookupInProgress = false;
+                m_neighborLookupProcess->kill();
+                m_neighborLookupProcess->waitForFinished(100);
+                m_neighborLookupProcess->readAll();
+            }
+            clearUdpNetworkInformation();
+        }
+
+        if (userDisconnect)
+        {
+            appendEvent(tr("UDP destination settings unlocked"),
+                        EventType::Normal);
+        }
+    }
+
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Receives the active UDP verification state.
+ * @param running true between successful UDP START and STOP completion.
+ * @return none
+ * @detail Clears the pending queued-command state and synchronizes START and STOP.
+ */
+void MainWindow::handleUdpReceptionStateChanged(bool running)
+{
+    m_udpTestRunning = running;
+    m_udpReceptionCommandPending = false;
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Receives a prepared UDP Statistics snapshot.
+ * @param startTime Reception start time in HH:MM:SS format.
+ * @param elapsedMilliseconds Elapsed monotonic test time in milliseconds.
+ * @param totalPayloadBytes Total accepted UDP payload bytes.
+ * @param currentCounter Last completely decoded counter value.
+ * @param counterOk Number of values matching the expected counter.
+ * @param counterErrors Number of counter mismatches.
+ * @param speedKbps Payload receive speed for the latest interval in Kb/s.
+ * @param packetsPerSecond Accepted UDP datagrams per second for the latest interval.
+ * @return none
+ * @detail Formats and displays values already calculated in UdpRxWorker.
+ */
+void MainWindow::handleUdpStatisticsUpdated(
+    const QString &startTime,
+    qint64 elapsedMilliseconds,
+    quint64 totalPayloadBytes,
+    quint64 currentCounter,
+    quint64 counterOk,
+    quint64 counterErrors,
+    double speedKbps,
+    double packetsPerSecond)
+{
+    ui->udpStartTimeValueLabel->setText(startTime.isEmpty()
+                                            ? QStringLiteral("--:--:--")
+                                            : startTime);
+    ui->udpElapsedTimeValueLabel->setText(
+        formatElapsedTime(elapsedMilliseconds));
+    ui->udpRxBytesLineEdit->setText(QString::number(totalPayloadBytes));
+    ui->udpCurrentCountLineEdit->setText(QString::number(currentCounter));
+    ui->udpPacketsPerSecondLineEdit->setText(formatSpeed(packetsPerSecond));
+    ui->udpSpeedLineEdit->setText(formatSpeed(speedKbps));
+    ui->udpCounterOkLineEdit->setText(QString::number(counterOk));
+    ui->udpCounterErrLineEdit->setText(QString::number(counterErrors));
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
  * @brief Creates and starts the dedicated RX worker thread.
  * @param none
  * @return none
@@ -880,52 +1814,210 @@ void MainWindow::initializeRxThread()
 /*-----------------------------------------------------------------------------*/
 
 /**
- * @brief Updates enabled states of the controls.
+ * @brief Creates and starts the dedicated UDP RX worker thread.
  * @param none
  * @return none
- * @detail Accounts for worker readiness, port state, active reception, and pending
- *         asynchronous GUI commands.
+ * @detail Moves UdpRxWorker to QThread, connects all queued commands and worker
+ *         replies, and starts the thread after all connections are configured.
+ */
+void MainWindow::initializeUdpRxThread()
+{
+    m_udpRxWorker = new UdpRxWorker;
+    m_udpRxWorker->moveToThread(&m_udpRxThread);
+    m_udpRxThread.setObjectName(QStringLiteral("RxDataTester_UDP_RX_Worker"));
+
+    connect(&m_udpRxThread,
+            &QThread::started,
+            m_udpRxWorker,
+            &UdpRxWorker::initialize);
+    connect(&m_udpRxThread,
+            &QThread::finished,
+            m_udpRxWorker,
+            &QObject::deleteLater);
+
+    connect(this,
+            &MainWindow::configureUdpConnectionRequested,
+            m_udpRxWorker,
+            &UdpRxWorker::configureConnection,
+            Qt::QueuedConnection);
+    connect(this,
+            &MainWindow::disconnectUdpConnectionRequested,
+            m_udpRxWorker,
+            &UdpRxWorker::disconnectConnection,
+            Qt::QueuedConnection);
+    connect(this,
+            &MainWindow::startUdpReceptionRequested,
+            m_udpRxWorker,
+            &UdpRxWorker::startReception,
+            Qt::QueuedConnection);
+    connect(this,
+            &MainWindow::stopUdpReceptionRequested,
+            m_udpRxWorker,
+            &UdpRxWorker::stopReception,
+            Qt::QueuedConnection);
+
+    connect(m_udpRxWorker,
+            &UdpRxWorker::workerReady,
+            this,
+            &MainWindow::handleUdpWorkerReady,
+            Qt::QueuedConnection);
+    connect(m_udpRxWorker,
+            &UdpRxWorker::eventGenerated,
+            this,
+            &MainWindow::handleWorkerEvent,
+            Qt::QueuedConnection);
+    connect(m_udpRxWorker,
+            &UdpRxWorker::connectionStateChanged,
+            this,
+            &MainWindow::handleUdpConnectionStateChanged,
+            Qt::QueuedConnection);
+    connect(m_udpRxWorker,
+            &UdpRxWorker::receptionStateChanged,
+            this,
+            &MainWindow::handleUdpReceptionStateChanged,
+            Qt::QueuedConnection);
+    connect(m_udpRxWorker,
+            &UdpRxWorker::statisticsUpdated,
+            this,
+            &MainWindow::handleUdpStatisticsUpdated,
+            Qt::QueuedConnection);
+    connect(m_udpRxWorker,
+            &UdpRxWorker::periodicLogLineReady,
+            this,
+            &MainWindow::writeLogLine,
+            Qt::QueuedConnection);
+
+    m_udpRxThread.start();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Updates enabled states of all controls.
+ * @param none
+ * @return none
+ * @detail Considers both worker threads, COM and UDP connection states, active
+ *         reception, tab locking, and pending asynchronous commands.
  */
 void MainWindow::updateControlStates()
 {
-    const bool asynchronousBusy = m_portOperationPending
-                                  || m_receptionCommandPending
-                                  || m_portLossRequestPending;
-    const bool applicationReady = m_workerReady && !m_shutdownPrepared;
+    const bool comAsynchronousBusy = m_portOperationPending
+                                      || m_receptionCommandPending
+                                      || m_portLossRequestPending;
+    const bool comWorkerAvailable = m_workerReady && !m_shutdownPrepared;
 
-    ui->openButton->setEnabled(applicationReady
+    const bool udpConnectionBusy = m_pingInProgress
+                                   || m_udpConnectionOperationPending;
+    const bool udpCommandBusy = m_udpReceptionCommandPending;
+    const bool udpWorkerAvailable = m_udpWorkerReady && !m_shutdownPrepared;
+
+    const bool udpModeLocksCom = m_pingInProgress
+                                 || m_udpConnectionOperationPending
+                                 || m_udpConnected
+                                 || m_udpTestRunning
+                                 || m_udpReceptionCommandPending;
+    const bool comModeLocksUdp = m_portOpen
+                                 || m_portOperationPending
+                                 || m_testRunning
+                                 || m_receptionCommandPending
+                                 || m_portLossRequestPending;
+
+    const int comTabIndex = ui->tabWidget->indexOf(ui->comTab);
+    const int udpTabIndex = ui->tabWidget->indexOf(ui->udpTab);
+    if (comTabIndex >= 0)
+    {
+        ui->tabWidget->setTabEnabled(comTabIndex,
+                                     !m_shutdownPrepared && !udpModeLocksCom);
+    }
+    if (udpTabIndex >= 0)
+    {
+        ui->tabWidget->setTabEnabled(udpTabIndex,
+                                     !m_shutdownPrepared && !comModeLocksUdp);
+    }
+
+    const bool comModeAvailable = comWorkerAvailable && !udpModeLocksCom;
+    ui->openButton->setEnabled(comModeAvailable
                                && !m_portOpen
-                               && !asynchronousBusy
+                               && !comAsynchronousBusy
                                && ui->portComboBox->count() > 0);
-    ui->closeButton->setEnabled(applicationReady
+    ui->closeButton->setEnabled(comWorkerAvailable
                                 && m_portOpen
                                 && !m_portOperationPending
                                 && !m_portLossRequestPending);
 
-    const bool portSettingsEnabled = applicationReady
+    const bool portSettingsEnabled = comModeAvailable
                                      && !m_portOpen
-                                     && !asynchronousBusy;
+                                     && !comAsynchronousBusy;
     ui->portComboBox->setEnabled(portSettingsEnabled);
     ui->baudComboBox->setEnabled(portSettingsEnabled);
     ui->parityComboBox->setEnabled(portSettingsEnabled);
     ui->stopsComboBox->setEnabled(portSettingsEnabled);
 
-    const bool patternEnabled = applicationReady
-                                && !m_testRunning
-                                && !asynchronousBusy;
-    ui->counterBitsComboBox->setEnabled(patternEnabled);
-    ui->blockBytesLineEdit->setEnabled(patternEnabled);
-    ui->initValueLineEdit->setEnabled(patternEnabled);
-    ui->periodMsLineEdit->setEnabled(patternEnabled);
+    const bool comPatternEnabled = comModeAvailable
+                                   && !m_testRunning
+                                   && !comAsynchronousBusy;
+    ui->counterBitsComboBox->setEnabled(comPatternEnabled);
+    ui->blockBytesLineEdit->setEnabled(comPatternEnabled);
+    ui->initValueLineEdit->setEnabled(comPatternEnabled);
+    ui->periodMsLineEdit->setEnabled(comPatternEnabled);
 
-    ui->startButton->setEnabled(applicationReady
+    ui->startButton->setEnabled(comModeAvailable
                                 && m_portOpen
                                 && !m_testRunning
-                                && !asynchronousBusy);
-    ui->stopButton->setEnabled(applicationReady
+                                && !comAsynchronousBusy);
+    ui->stopButton->setEnabled(comWorkerAvailable
                                && m_portOpen
                                && m_testRunning
-                               && !asynchronousBusy);
+                               && !comAsynchronousBusy);
+
+    const bool udpModeAvailable = udpWorkerAvailable && !comModeLocksUdp;
+    const bool udpDestinationEditable = udpModeAvailable
+                                        && !m_udpConnected
+                                        && !udpConnectionBusy
+                                        && !udpCommandBusy;
+    ui->udpDestinationIpLineEdit->setEnabled(udpDestinationEditable);
+    ui->udpDestinationPortLineEdit->setEnabled(udpDestinationEditable);
+
+    const bool destinationIpPresent =
+        !ui->udpDestinationIpLineEdit->text().trimmed().isEmpty();
+    const bool destinationPortPresent =
+        !ui->udpDestinationPortLineEdit->text().trimmed().isEmpty();
+    const bool udpDisconnectAvailable = m_udpConnected
+                                        && !m_udpTestRunning
+                                        && !udpConnectionBusy
+                                        && !udpCommandBusy;
+    const bool udpConnectAvailable = !m_udpConnected
+                                     && !udpConnectionBusy
+                                     && !udpCommandBusy
+                                     && destinationIpPresent
+                                     && destinationPortPresent;
+    ui->udpConnectButton->setEnabled(udpModeAvailable
+                                     && (udpDisconnectAvailable
+                                         || udpConnectAvailable));
+    ui->udpConnectButton->setText(
+        m_udpConnected ? QStringLiteral("DISCONNECT")
+                       : QStringLiteral("CONNECT"));
+
+    const bool udpPatternEnabled = udpModeAvailable
+                                   && !m_udpTestRunning
+                                   && !udpConnectionBusy
+                                   && !udpCommandBusy;
+    ui->udpCounterBitsComboBox->setEnabled(udpPatternEnabled);
+    ui->udpBlockBytesLineEdit->setEnabled(udpPatternEnabled);
+    ui->udpInitValueLineEdit->setEnabled(udpPatternEnabled);
+    ui->udpTogetherLineEdit->setEnabled(udpPatternEnabled);
+    ui->udpPeriodMsLineEdit->setEnabled(udpPatternEnabled);
+
+    ui->udpStartButton->setEnabled(udpModeAvailable
+                                   && m_udpConnected
+                                   && !m_udpTestRunning
+                                   && !udpConnectionBusy
+                                   && !udpCommandBusy);
+    ui->udpStopButton->setEnabled(udpWorkerAvailable
+                                  && m_udpConnected
+                                  && m_udpTestRunning
+                                  && !udpConnectionBusy
+                                  && !udpCommandBusy);
 }
 
 /*-----------------------------------------------------------------------------*/
@@ -1145,6 +2237,32 @@ void MainWindow::loadSettings()
                        QStringLiteral("100"))
             .toString());
 
+    ui->udpDestinationIpLineEdit->setText(
+        settings.value(QStringLiteral("udp/destinationIp"), QString()).toString());
+    ui->udpDestinationPortLineEdit->setText(
+        settings.value(QStringLiteral("udp/destinationPort"), QString()).toString());
+    selectComboBoxText(
+        ui->udpCounterBitsComboBox,
+        settings.value(QStringLiteral("udp/pattern/counterBits"),
+                       QStringLiteral("32"))
+            .toString());
+    ui->udpBlockBytesLineEdit->setText(
+        settings.value(QStringLiteral("udp/pattern/blockBytes"),
+                       QStringLiteral("128"))
+            .toString());
+    ui->udpInitValueLineEdit->setText(
+        settings.value(QStringLiteral("udp/pattern/initValue"),
+                       QStringLiteral("0"))
+            .toString());
+    ui->udpTogetherLineEdit->setText(
+        settings.value(QStringLiteral("udp/pattern/together"),
+                       QStringLiteral("1"))
+            .toString());
+    ui->udpPeriodMsLineEdit->setText(
+        settings.value(QStringLiteral("udp/pattern/periodMs"),
+                       QStringLiteral("100"))
+            .toString());
+
     if (settings.status() != QSettings::NoError)
     {
         appendEvent(tr("failed to read saved QSettings"),
@@ -1166,6 +2284,10 @@ void MainWindow::saveSettings()
     normalizeBlockSize();
     normalizeInitialValue();
     normalizePeriod();
+    normalizeUdpBlockSize();
+    normalizeUdpInitialValue();
+    normalizeUdpTogether();
+    normalizeUdpPeriod();
 
     QSettings settings;
     settings.setValue(QStringLiteral("window/geometry"), saveGeometry());
@@ -1194,6 +2316,20 @@ void MainWindow::saveSettings()
                       ui->initValueLineEdit->text());
     settings.setValue(QStringLiteral("pattern/periodMs"),
                       ui->periodMsLineEdit->text());
+    settings.setValue(QStringLiteral("udp/destinationIp"),
+                      ui->udpDestinationIpLineEdit->text().trimmed());
+    settings.setValue(QStringLiteral("udp/destinationPort"),
+                      ui->udpDestinationPortLineEdit->text().trimmed());
+    settings.setValue(QStringLiteral("udp/pattern/counterBits"),
+                      ui->udpCounterBitsComboBox->currentText());
+    settings.setValue(QStringLiteral("udp/pattern/blockBytes"),
+                      ui->udpBlockBytesLineEdit->text());
+    settings.setValue(QStringLiteral("udp/pattern/initValue"),
+                      ui->udpInitValueLineEdit->text());
+    settings.setValue(QStringLiteral("udp/pattern/together"),
+                      ui->udpTogetherLineEdit->text());
+    settings.setValue(QStringLiteral("udp/pattern/periodMs"),
+                      ui->udpPeriodMsLineEdit->text());
     settings.sync();
 
     if (settings.status() != QSettings::NoError)
@@ -1209,8 +2345,9 @@ void MainWindow::saveSettings()
  * @brief Performs one-time application shutdown.
  * @param none
  * @return none
- * @detail Invokes RxWorker shutdown through a blocking queued call, waits for QThread,
- *         processes final events, saves settings, and closes the log.
+ * @detail Invokes both receiver-worker shutdown slots through blocking queued calls,
+ *         waits for both QThreads, processes final events, saves settings, and closes
+ *         the log.
  */
 void MainWindow::prepareShutdown()
 {
@@ -1220,6 +2357,7 @@ void MainWindow::prepareShutdown()
     }
 
     m_shutdownPrepared = true;
+    stopUdpProcesses();
     m_portRefreshTimer.stop();
     updateControlStates();
 
@@ -1231,7 +2369,7 @@ void MainWindow::prepareShutdown()
             Qt::BlockingQueuedConnection);
         if (!invoked)
         {
-            appendEvent(tr("failed to invoke RX worker shutdown"),
+            appendEvent(tr("failed to invoke COM RX worker shutdown"),
                         EventType::Error);
         }
 
@@ -1242,15 +2380,40 @@ void MainWindow::prepareShutdown()
         m_rxWorker = nullptr;
     }
 
+    if (m_udpRxWorker != nullptr && m_udpRxThread.isRunning())
+    {
+        const bool invoked = QMetaObject::invokeMethod(
+            m_udpRxWorker,
+            "shutdown",
+            Qt::BlockingQueuedConnection);
+        if (!invoked)
+        {
+            appendEvent(tr("failed to invoke UDP RX worker shutdown"),
+                        EventType::Error);
+        }
+
+        QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
+        m_udpRxThread.quit();
+        m_udpRxThread.wait();
+        QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
+        m_udpRxWorker = nullptr;
+    }
+
     m_workerReady = false;
+    m_udpWorkerReady = false;
     m_portOpen = false;
     m_testRunning = false;
     m_portOperationPending = false;
     m_receptionCommandPending = false;
     m_portLossRequestPending = false;
+    m_udpConnected = false;
+    m_udpConnectionOperationPending = false;
+    m_udpTestRunning = false;
+    m_udpReceptionCommandPending = false;
+    m_udpDisconnectRequestedByUser = false;
 
     saveSettings();
-    appendEvent(tr("RxDataTester (v.1.1) stopped"),
+    appendEvent(tr("RxDataTester (v.1.4) stopped"),
                 EventType::Normal);
     closeLogFile();
 }
@@ -1366,7 +2529,622 @@ void MainWindow::synchronizePortSnapshot(
 /*-----------------------------------------------------------------------------*/
 
 /**
+ * @brief Sets the GUI-side UDP receiver connection state.
+ * @param connected true when the persistent UDP socket is bound and ready.
+ * @return none
+ * @detail Locks or unlocks the UDP endpoint fields and updates tab states.
+ */
+void MainWindow::setUdpConnectionState(bool connected)
+{
+    m_udpConnected = connected;
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Clears displayed UDP interface and destination-MAC information.
+ * @param none
+ * @return none
+ * @detail Prevents stale route information from remaining visible after edits.
+ */
+void MainWindow::clearUdpNetworkInformation()
+{
+    m_udpOurIp.clear();
+    m_udpOurMac.clear();
+    m_udpDestinationMac.clear();
+    m_udpDestinationIp.clear();
+    m_udpDestinationPort = 0;
+    m_pingDestinationIp.clear();
+    m_neighborLookupIp.clear();
+
+    ui->udpOurIpValueLabel->setText(QStringLiteral("--"));
+    ui->udpOurMacValueLabel->setText(QStringLiteral("--"));
+    ui->udpDestinationMacValueLabel->setText(QStringLiteral("--"));
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Reads and validates the UDP destination fields.
+ * @param destinationIp Output destination IPv4 string.
+ * @param destinationPort Output destination UDP port.
+ * @param errorText Output fixed English validation error.
+ * @return true when the IPv4 address and port 1...65535 are valid.
+ * @detail Character validators block unwanted input while this method verifies the
+ *         complete numeric address and port range.
+ */
+bool MainWindow::readUdpDestination(QString *destinationIp,
+                                    quint16 *destinationPort,
+                                    QString *errorText) const
+{
+    if (destinationIp == nullptr
+        || destinationPort == nullptr
+        || errorText == nullptr)
+    {
+        return false;
+    }
+
+    const QString ipText = ui->udpDestinationIpLineEdit->text().trimmed();
+    if (ipText.isEmpty())
+    {
+        *errorText = tr("destination IP is empty");
+        return false;
+    }
+
+    QHostAddress address;
+    if (!address.setAddress(ipText)
+        || address.protocol() != QAbstractSocket::IPv4Protocol)
+    {
+        *errorText = tr("destination IP is not a valid IPv4 address");
+        return false;
+    }
+
+    if (address == QHostAddress(QHostAddress::AnyIPv4))
+    {
+        *errorText = tr("destination IP 0.0.0.0 cannot be used");
+        return false;
+    }
+
+    bool portOk = false;
+    const uint portValue =
+        ui->udpDestinationPortLineEdit->text().trimmed().toUInt(&portOk, 10);
+    if (!portOk || portValue == 0U || portValue > 65535U)
+    {
+        *errorText = tr("listening Port must be in range 1...65535");
+        return false;
+    }
+
+    *destinationIp = address.toString();
+    *destinationPort = static_cast<quint16>(portValue);
+    errorText->clear();
+    return true;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Reads and validates UDP Pattern values from the GUI.
+ * @param settings Output pointer for validated UDP Pattern settings.
+ * @param errorText Output pointer for a validation error message.
+ * @return true when all UDP Pattern values are valid; otherwise false.
+ * @detail Checks counter width, payload size, alignment, Togeth, Period, and initial
+ *         value range.
+ */
+bool MainWindow::readUdpPatternSettings(UdpPatternSettings *settings,
+                                        QString *errorText) const
+{
+    if (settings == nullptr || errorText == nullptr)
+    {
+        return false;
+    }
+
+    bool counterOk = false;
+    const int counterBits =
+        ui->udpCounterBitsComboBox->currentText().toInt(&counterOk, 10);
+    if (!counterOk
+        || (counterBits != 8
+            && counterBits != 16
+            && counterBits != 32
+            && counterBits != 64))
+    {
+        *errorText = tr("unsupported counter width");
+        return false;
+    }
+
+    const int counterBytes = counterBits / 8;
+    bool blockOk = false;
+    const qlonglong blockBytesValue =
+        ui->udpBlockBytesLineEdit->text().trimmed().toLongLong(&blockOk, 10);
+    if (!blockOk
+        || blockBytesValue <= 0
+        || blockBytesValue > static_cast<qlonglong>(kMaximumIpv4UdpPayloadBytes)
+        || (blockBytesValue % counterBytes) != 0)
+    {
+        *errorText = tr("block, bytes must be 1...65507 and a multiple of %1 bytes")
+                         .arg(counterBytes);
+        return false;
+    }
+
+    bool togetherOk = false;
+    const qlonglong togetherValue =
+        ui->udpTogetherLineEdit->text().trimmed().toLongLong(&togetherOk, 10);
+    if (!togetherOk
+        || togetherValue <= 0
+        || togetherValue > std::numeric_limits<int>::max())
+    {
+        *errorText = tr("Togeth must be a positive decimal number within int range");
+        return false;
+    }
+
+    bool periodOk = false;
+    const qlonglong periodValue =
+        ui->udpPeriodMsLineEdit->text().trimmed().toLongLong(&periodOk, 10);
+    if (!periodOk
+        || periodValue < 0
+        || periodValue > std::numeric_limits<int>::max())
+    {
+        *errorText = tr("Period, ms is outside the valid range");
+        return false;
+    }
+
+    quint64 initialValue = 0;
+    if (!parseUdpInitialValue(&initialValue))
+    {
+        *errorText = tr("init value is invalid or does not fit the selected counter width");
+        return false;
+    }
+
+    settings->counterBits = counterBits;
+    settings->counterBytes = counterBytes;
+    settings->blockBytes = static_cast<int>(blockBytesValue);
+    settings->togetherCount = static_cast<int>(togetherValue);
+    settings->periodMs = static_cast<int>(periodValue);
+    settings->initialValue = initialValue;
+    settings->maximumCounterValue = counterBits == 64
+                                        ? std::numeric_limits<quint64>::max()
+                                        : (quint64(1) << counterBits) - quint64(1);
+    errorText->clear();
+    return true;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Builds a UDP Pattern description for the event log.
+ * @param settings Validated UDP Pattern settings.
+ * @return A counter/init/block/Togeth/period/values-per-packet/bo=LE string.
+ * @detail Hexadecimal input also includes its decimal equivalent.
+ */
+QString MainWindow::udpPatternDescription(
+    const UdpPatternSettings &settings) const
+{
+    QString initialValueText = ui->udpInitValueLineEdit->text().trimmed();
+    if (initialValueText.startsWith(QStringLiteral("0x"),
+                                    Qt::CaseInsensitive))
+    {
+        initialValueText +=
+            tr(" (dec %1)").arg(QString::number(settings.initialValue));
+    }
+
+    const int valuesPerPacket = settings.blockBytes / settings.counterBytes;
+    return tr("Pattern: counter=%1 bits; init=%2; block=%3 bytes; "
+              "Togeth=%4; period=%5 ms; values/packet=%6; bo=LE")
+        .arg(settings.counterBits)
+        .arg(initialValueText)
+        .arg(settings.blockBytes)
+        .arg(settings.togetherCount)
+        .arg(settings.periodMs)
+        .arg(valuesPerPacket);
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Resolves the local interface selected for a UDP destination.
+ * @param destinationIp Destination IPv4 address.
+ * @param destinationPort Destination UDP port used for route selection.
+ * @param localIp Output local IPv4 address.
+ * @param localMac Output local interface MAC address or -- when unavailable.
+ * @param errorText Output fixed English route-selection error.
+ * @return true when an outgoing IPv4 address was selected.
+ * @detail Uses a temporary connected QUdpSocket only as an operating-system route
+ *         probe and closes it before returning.
+ */
+bool MainWindow::resolveUdpRoute(const QString &destinationIp,
+                                 quint16 destinationPort,
+                                 QString *localIp,
+                                 QString *localMac,
+                                 QString *errorText) const
+{
+    if (localIp == nullptr || localMac == nullptr || errorText == nullptr)
+    {
+        return false;
+    }
+
+    QHostAddress destinationAddress;
+    if (!destinationAddress.setAddress(destinationIp)
+        || destinationAddress.protocol() != QAbstractSocket::IPv4Protocol)
+    {
+        *errorText = tr("destination IP is not a valid IPv4 address");
+        return false;
+    }
+
+    QUdpSocket routeProbe;
+    routeProbe.connectToHost(destinationAddress,
+                             destinationPort,
+                             QIODevice::WriteOnly);
+    if (routeProbe.state() != QAbstractSocket::ConnectedState
+        && !routeProbe.waitForConnected(kRouteProbeTimeoutMs))
+    {
+        *errorText = tr("the operating system could not select an outgoing interface");
+        routeProbe.abort();
+        return false;
+    }
+
+    const QHostAddress selectedAddress = routeProbe.localAddress();
+    routeProbe.abort();
+
+    if (selectedAddress.isNull()
+        || selectedAddress == QHostAddress(QHostAddress::AnyIPv4)
+        || selectedAddress.protocol() != QAbstractSocket::IPv4Protocol)
+    {
+        *errorText = tr("the operating system did not provide an outgoing IPv4 address");
+        return false;
+    }
+
+    *localIp = selectedAddress.toString();
+    *localMac = localMacForIp(*localIp);
+    errorText->clear();
+    return true;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Finds a network-interface MAC address by local IPv4 address.
+ * @param localIp Local IPv4 address to match.
+ * @return Normalized uppercase MAC address or -- when unavailable.
+ * @detail Searches active QNetworkInterface address entries.
+ */
+QString MainWindow::localMacForIp(const QString &localIp) const
+{
+    QHostAddress targetAddress;
+    if (!targetAddress.setAddress(localIp))
+    {
+        return QStringLiteral("--");
+    }
+
+    const QList<QNetworkInterface> interfaces =
+        QNetworkInterface::allInterfaces();
+    for (const QNetworkInterface &networkInterface : interfaces)
+    {
+        if (!networkInterface.flags().testFlag(QNetworkInterface::IsUp))
+        {
+            continue;
+        }
+
+        const QList<QNetworkAddressEntry> entries =
+            networkInterface.addressEntries();
+        for (const QNetworkAddressEntry &entry : entries)
+        {
+            if (entry.ip() != targetAddress)
+            {
+                continue;
+            }
+
+            const QString normalizedMac =
+                normalizeMacAddress(networkInterface.hardwareAddress());
+            return normalizedMac.isEmpty() ? QStringLiteral("--")
+                                           : normalizedMac;
+        }
+    }
+
+    return QStringLiteral("--");
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Builds the UDP Connection Settings event text.
+ * @param destinationIp Validated destination IPv4 address.
+ * @param destinationPort Validated destination UDP port.
+ * @return One-line destination and local-interface description.
+ * @detail The destination MAC is logged separately after the neighbor lookup.
+ */
+QString MainWindow::udpConnectionDescription(const QString &destinationIp,
+                                             quint16 destinationPort) const
+{
+    const QString localIp =
+        m_udpOurIp.isEmpty() ? QStringLiteral("--") : m_udpOurIp;
+    const QString localMac =
+        m_udpOurMac.isEmpty() ? QStringLiteral("--") : m_udpOurMac;
+
+    return tr("Connection Settings: dest_IP=%1; listen_PORT=%2; our_IP=%3; our_MAC=%4")
+        .arg(destinationIp)
+        .arg(destinationPort)
+        .arg(localIp)
+        .arg(localMac);
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Stops active UDP helper processes during application shutdown.
+ * @param none
+ * @return none
+ * @detail Terminates ping or neighbor lookup and force-kills a process if needed.
+ */
+void MainWindow::stopUdpProcesses()
+{
+    m_pingTimeoutTimer.stop();
+    m_pingInProgress = false;
+    m_neighborLookupInProgress = false;
+    m_udpConnectionOperationPending = false;
+
+    const QList<QProcess *> processes = {
+        m_pingProcess,
+        m_neighborLookupProcess
+    };
+    for (QProcess *process : processes)
+    {
+        if (process == nullptr || process->state() == QProcess::NotRunning)
+        {
+            continue;
+        }
+
+        process->terminate();
+        if (!process->waitForFinished(250))
+        {
+            process->kill();
+            process->waitForFinished(250);
+        }
+
+        process->readAll();
+    }
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Starts an asynchronous destination-MAC lookup.
+ * @param destinationIp IPv4 address that replied to ping.
+ * @return none
+ * @detail Uses arp on Windows and macOS or ip neigh on Linux, then parses numeric IP
+ *         and MAC patterns from the output.
+ */
+void MainWindow::startDestinationMacLookup(const QString &destinationIp)
+{
+    if (m_neighborLookupProcess == nullptr
+        || m_neighborLookupProcess->state() != QProcess::NotRunning)
+    {
+        appendEvent(tr("destination MAC lookup process is already running"),
+                    EventType::Error);
+        updateControlStates();
+        return;
+    }
+
+    QString program;
+    QStringList arguments;
+#ifdef Q_OS_WIN
+    program = QStringLiteral("arp");
+    arguments << QStringLiteral("-a") << destinationIp;
+#elif defined(Q_OS_MACOS) || defined(Q_OS_MAC)
+    program = QStringLiteral("arp");
+    arguments << QStringLiteral("-n") << destinationIp;
+#else
+    program = QStringLiteral("ip");
+    arguments << QStringLiteral("neigh")
+              << QStringLiteral("show")
+              << destinationIp;
+#endif
+
+    m_neighborLookupIp = destinationIp;
+    m_neighborLookupInProgress = true;
+    updateControlStates();
+    m_neighborLookupProcess->start(program, arguments);
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Extracts a destination MAC address from neighbor-table output.
+ * @param output Process output converted with the local 8-bit codec.
+ * @param destinationIp Destination IPv4 address used to select the correct line.
+ * @return Normalized uppercase MAC address or an empty string when not found.
+ * @detail Accepts both colon-separated and hyphen-separated MAC formats.
+ */
+QString MainWindow::parseDestinationMac(const QString &output,
+                                        const QString &destinationIp) const
+{
+    const QRegularExpression destinationExpression(
+        QStringLiteral("(^|[^0-9.])%1([^0-9.]|$)")
+            .arg(QRegularExpression::escape(destinationIp)));
+    const QRegularExpression macExpression(
+        QStringLiteral("\\b([0-9A-Fa-f]{1,2}(?:[:-][0-9A-Fa-f]{1,2}){5})\\b"));
+
+    const QStringList lines =
+        output.split(QRegularExpression(QStringLiteral("[\\r\\n]+")),
+                     QString::SkipEmptyParts);
+    for (const QString &line : lines)
+    {
+        if (!destinationExpression.match(line).hasMatch())
+        {
+            continue;
+        }
+
+        const QRegularExpressionMatch macMatch = macExpression.match(line);
+        if (!macMatch.hasMatch())
+        {
+            continue;
+        }
+
+        return normalizeMacAddress(macMatch.captured(1));
+    }
+
+    return QString();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Normalizes a textual MAC address.
+ * @param macAddress Colon-separated or hyphen-separated MAC address.
+ * @return Uppercase colon-separated MAC address or an empty string when invalid.
+ * @detail Validation requires exactly six hexadecimal octets.
+ */
+QString MainWindow::normalizeMacAddress(const QString &macAddress) const
+{
+    QString normalized = macAddress.trimmed();
+    normalized.replace(QLatin1Char('-'), QLatin1Char(':'));
+
+    const QStringList octets = normalized.split(QLatin1Char(':'));
+    if (octets.size() != 6)
+    {
+        return QString();
+    }
+
+    const QRegularExpression octetExpression(
+        QStringLiteral("^[0-9A-Fa-f]{1,2}$"));
+    QStringList uppercaseOctets;
+    for (const QString &octet : octets)
+    {
+        if (!octetExpression.match(octet).hasMatch())
+        {
+            return QString();
+        }
+
+        uppercaseOctets.append(
+            octet.rightJustified(2, QLatin1Char('0')).toUpper());
+    }
+
+    return uppercaseOctets.join(QLatin1Char(':'));
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Counts successful ping replies.
+ * @param output Merged ping standard output and standard error.
+ * @return Number of case-insensitive TTL fields found in the output.
+ * @detail TTL is stable across localized ping output and avoids localized EVENTS.
+ */
+int MainWindow::pingReplyCount(const QString &output) const
+{
+    const QRegularExpression ttlExpression(
+        QStringLiteral("\\bttl\\s*[=:]\\s*\\d+\\b"),
+        QRegularExpression::CaseInsensitiveOption);
+    QRegularExpressionMatchIterator iterator =
+        ttlExpression.globalMatch(output);
+
+    int count = 0;
+    while (iterator.hasNext())
+    {
+        iterator.next();
+        ++count;
+    }
+
+    return count;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Parses the UDP initial counter value.
+ * @param value Output pointer for the parsed unsigned value.
+ * @return true when decimal or 0x-prefixed input fits the selected UDP counter.
+ * @detail The method does not modify the interface and is used by normalization.
+ */
+bool MainWindow::parseUdpInitialValue(quint64 *value) const
+{
+    if (value == nullptr)
+    {
+        return false;
+    }
+
+    QString text = ui->udpInitValueLineEdit->text().trimmed();
+    if (text.isEmpty())
+    {
+        return false;
+    }
+
+    const bool hexadecimal =
+        text.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive);
+    if (hexadecimal)
+    {
+        text.remove(0, 2);
+    }
+
+    if (text.isEmpty())
+    {
+        return false;
+    }
+
+    bool conversionOk = false;
+    const quint64 convertedValue =
+        text.toULongLong(&conversionOk, hexadecimal ? 16 : 10);
+    if (!conversionOk || convertedValue > udpMaximumCounterValue())
+    {
+        return false;
+    }
+
+    *value = convertedValue;
+    return true;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Returns the selected UDP counter size in bytes.
+ * @param none
+ * @return A size of 1, 2, 4, or 8 bytes.
+ * @detail An unexpected GUI value is safely converted to one byte.
+ */
+quint64 MainWindow::udpCounterBytes() const
+{
+    bool conversionOk = false;
+    const int counterBits =
+        ui->udpCounterBitsComboBox->currentText().toInt(&conversionOk, 10);
+    if (!conversionOk || counterBits <= 0)
+    {
+        return 1U;
+    }
+
+    return static_cast<quint64>(counterBits / 8);
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Returns the maximum value of the selected UDP counter.
+ * @param none
+ * @return Maximum unsigned value for the current UDP counter width.
+ * @detail Uses numeric_limits for 64 bits to avoid an invalid shift.
+ */
+quint64 MainWindow::udpMaximumCounterValue() const
+{
+    bool conversionOk = false;
+    const int counterBits =
+        ui->udpCounterBitsComboBox->currentText().toInt(&conversionOk, 10);
+
+    if (!conversionOk || counterBits <= 0)
+    {
+        return std::numeric_limits<quint8>::max();
+    }
+
+    if (counterBits >= 64)
+    {
+        return std::numeric_limits<quint64>::max();
+    }
+
+    return (quint64(1) << counterBits) - quint64(1);
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
  * @brief Reads and validates Pattern settings.
+
  * @param settings Output pointer for the validated settings.
  * @param errorText Output pointer for a validation error message.
  * @return true when all values are valid; otherwise false.

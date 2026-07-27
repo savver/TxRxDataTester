@@ -9,7 +9,7 @@
  * @param argc Number of command-line arguments.
  * @param argv Array of command-line arguments.
  * @return Exit code returned by the Qt event loop.
- * @detail Creates QApplication, sets the QSettings identifiers and version 1.5, shows
+ * @detail Creates QApplication, sets the QSettings identifiers and version 1.7, shows
  *         the main window, and enters the Qt event loop.
  */
 int main(int argc, char *argv[])
@@ -19,7 +19,7 @@ int main(int argc, char *argv[])
     QCoreApplication::setOrganizationName(QStringLiteral("TxDataTester"));
     QCoreApplication::setOrganizationDomain(QStringLiteral("txdatatester.local"));
     QCoreApplication::setApplicationName(QStringLiteral("TxDataTester"));
-    QCoreApplication::setApplicationVersion(QStringLiteral("1.5"));
+    QCoreApplication::setApplicationVersion(QStringLiteral("1.7"));
 
     MainWindow mainWindow;
     mainWindow.show();

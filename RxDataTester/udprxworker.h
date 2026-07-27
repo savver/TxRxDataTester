@@ -1,0 +1,522 @@
+#ifndef UDPRXWORKER_H
+#define UDPRXWORKER_H
+
+#include <QAbstractSocket>
+#include <QElapsedTimer>
+#include <QHostAddress>
+#include <QObject>
+#include <QSet>
+#include <QString>
+
+class QTimer;
+class QUdpSocket;
+
+/**
+ * @brief UDP counter-pattern reception worker.
+ * @detail Runs in a dedicated QThread and owns QUdpSocket, datagram reception,
+ *         little-endian counter verification, and UDP Statistics calculations.
+ */
+class UdpRxWorker final : public QObject
+{
+    Q_OBJECT
+
+public:
+    /**
+     * @brief Creates the UDP receiver worker object.
+     * @param parent Parent QObject; normally omitted before moveToThread().
+     * @return none
+     * @detail Initializes scalar state only. QUdpSocket and QTimer are created later by
+     *         initialize() after the object is moved to its worker thread.
+     */
+    explicit UdpRxWorker(QObject *parent = nullptr);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Destroys the UDP receiver worker object.
+     * @param none
+     * @return none
+     * @detail Stops the timer and closes the UDP socket as a safeguard after normal
+     *         shutdown.
+     */
+    ~UdpRxWorker() override;
+
+signals:
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Reports that the UDP RX worker is ready.
+     * @param none
+     * @return none
+     * @detail Emitted after QUdpSocket and the Statistics timer are created in the
+     *         worker thread.
+     */
+    void workerReady();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Sends a UDP event to the GUI and text log.
+     * @param timestamp Event timestamp in HH:MM:SS.mmm format.
+     * @param text Event text without a timestamp.
+     * @param error true for a red error entry; otherwise false.
+     * @return none
+     * @detail The timestamp is generated in the UDP worker thread at the actual event
+     *         time.
+     */
+    void eventGenerated(const QString &timestamp,
+                        const QString &text,
+                        bool error);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Reports the persistent UDP receiver-socket state.
+     * @param connected true when the socket is bound and ready to receive.
+     * @param expectedSourceIp Configured IPv4 address of the expected transmitter.
+     * @param listenPort Local UDP port reserved for reception.
+     * @param localIp Local IPv4 address to which the socket is bound.
+     * @param causedByFailure true when the socket was closed because of an error.
+     * @return none
+     * @detail The GUI uses this state snapshot without accessing QUdpSocket across
+     *         threads.
+     */
+    void connectionStateChanged(bool connected,
+                                const QString &expectedSourceIp,
+                                quint16 listenPort,
+                                const QString &localIp,
+                                bool causedByFailure);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Reports the active UDP reception state.
+     * @param running true between a successful START and completion of STOP.
+     * @return none
+     * @detail The GUI uses the signal to synchronize UDP START, STOP, and Pattern
+     *         controls.
+     */
+    void receptionStateChanged(bool running);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Sends a prepared UDP Statistics snapshot to the GUI.
+     * @param startTime Reception start time in HH:MM:SS format.
+     * @param elapsedMilliseconds Elapsed monotonic test time in milliseconds.
+     * @param totalPayloadBytes Total accepted UDP payload bytes.
+     * @param currentCounter Last completely decoded counter value.
+     * @param counterOk Number of values matching the expected counter.
+     * @param counterErrors Number of values not matching the expected counter.
+     * @param speedKbps Payload receive speed for the latest interval in Kb/s.
+     * @param packetsPerSecond Accepted UDP datagrams per second for the latest interval.
+     * @return none
+     * @detail Network headers and ignored datagrams from unexpected source addresses are
+     *         not included.
+     */
+    void statisticsUpdated(const QString &startTime,
+                           qint64 elapsedMilliseconds,
+                           quint64 totalPayloadBytes,
+                           quint64 currentCounter,
+                           quint64 counterOk,
+                           quint64 counterErrors,
+                           double speedKbps,
+                           double packetsPerSecond);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Sends the additional twenty-second UDP Statistics line.
+     * @param line Complete preformatted line with timestamp and values.
+     * @return none
+     * @detail The GUI writes the line only to the text log and does not display it in
+     *         EVENTS.
+     */
+    void periodicLogLineReady(const QString &line);
+
+public slots:
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Initializes resources owned by the UDP RX worker thread.
+     * @param none
+     * @return none
+     * @detail Creates QUdpSocket and the Statistics timer, connects their signals, and
+     *         reports readiness to the GUI.
+     */
+    void initialize();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Creates and binds the persistent UDP receiver socket.
+     * @param expectedSourceIp IPv4 address of the transmitter selected in Connection.
+     * @param listenPort Local UDP port on which datagrams are expected.
+     * @param localIp Local IPv4 address selected by the operating-system route.
+     * @return none
+     * @detail Reserves localIp:listenPort exclusively and ignores datagrams received from
+     *         other source IP addresses during an active test.
+     */
+    void configureConnection(const QString &expectedSourceIp,
+                             quint16 listenPort,
+                             const QString &localIp);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Closes the persistent UDP receiver socket.
+     * @param none
+     * @return none
+     * @detail Stops active reception when necessary and releases the reserved local UDP
+     *         port.
+     */
+    void disconnectConnection();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Starts UDP reception and sequential-counter verification.
+     * @param counterBits Counter width: 8, 16, 32, or 64 bits.
+     * @param blockBytes Expected transmitter payload size in bytes.
+     * @param togetherCount Informational number of packets in one transmitter burst.
+     * @param periodMs Informational transmitter burst period in milliseconds.
+     * @param initialValue First expected counter value.
+     * @param patternDescription Preformatted Pattern description for the event log.
+     * @return none
+     * @detail Discards datagrams queued before START and verifies each accepted datagram
+     *         independently while preserving counter continuity between datagrams.
+     */
+    void startReception(int counterBits,
+                        int blockBytes,
+                        int togetherCount,
+                        int periodMs,
+                        quint64 initialValue,
+                        const QString &patternDescription);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Stops UDP reception and counter verification.
+     * @param none
+     * @return none
+     * @detail Captures a final Statistics snapshot and leaves the bound UDP socket ready
+     *         for another START operation.
+     */
+    void stopReception();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Shuts down the UDP RX worker before application exit.
+     * @param none
+     * @return none
+     * @detail Stops active reception, closes the socket and timer, and leaves the object
+     *         ready for QThread::quit().
+     */
+    void shutdown();
+
+private slots:
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Reads and processes pending UDP datagrams.
+     * @param none
+     * @return none
+     * @detail Processes a bounded batch per event-loop callback so Statistics and STOP
+     *         remain responsive under a dense packet stream.
+     */
+    void handleReadyRead();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Performs the one-second UDP Statistics update.
+     * @param none
+     * @return none
+     * @detail Calculates payload speed and packet rate from the actual elapsed interval
+     *         and updates twenty-second sample statistics.
+     */
+    void updateStatistics();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Handles an asynchronous UDP socket error.
+     * @param error QAbstractSocket error reported by QUdpSocket.
+     * @return none
+     * @detail Temporary errors are logged without closing the socket; fatal errors stop
+     *         reception and release the connection.
+     */
+    void handleSocketError(QAbstractSocket::SocketError error);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Handles an unexpected UDP socket state transition.
+     * @param state New QAbstractSocket state.
+     * @return none
+     * @detail Detects an unrequested close of a logically connected receiver socket.
+     */
+    void handleSocketStateChanged(QAbstractSocket::SocketState state);
+
+private:
+    /**
+     * @brief Validated settings of the active UDP pattern.
+     * @detail Counter verification depends on counterBytes and initialValue. blockBytes,
+     *         togetherCount, and periodMs are retained for validation and the log.
+     */
+    struct PatternSettings
+    {
+        int counterBits = 8;
+        int counterBytes = 1;
+        int blockBytes = 1;
+        int togetherCount = 1;
+        int periodMs = 0;
+        quint64 initialValue = 0;
+        quint64 maximumCounterValue = 0xFFU;
+    };
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Validates UDP Pattern arguments and builds worker settings.
+     * @param counterBits Counter bit width.
+     * @param blockBytes Expected UDP payload size in bytes.
+     * @param togetherCount Informational packets-per-burst value.
+     * @param periodMs Informational burst period in milliseconds.
+     * @param initialValue First expected counter value.
+     * @param settings Output pointer for validated settings.
+     * @param errorText Output pointer for a validation error message.
+     * @return true when all parameters are valid; otherwise false.
+     * @detail Checks supported widths, IPv4 UDP payload limits, alignment, positive
+     *         Togeth, Period range, and initial-value range.
+     */
+    bool makePatternSettings(int counterBits,
+                             int blockBytes,
+                             int togetherCount,
+                             int periodMs,
+                             quint64 initialValue,
+                             PatternSettings *settings,
+                             QString *errorText) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Resets UDP Statistics and verification state before START.
+     * @param settings Validated settings for the new test.
+     * @return none
+     * @detail Sets expected to init, clears totals and interval samples, starts monotonic
+     *         timing, and emits the initial zero-valued snapshot.
+     */
+    void resetStatistics(const PatternSettings &settings);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Discards every UDP datagram currently queued in the socket.
+     * @param none
+     * @return Number of datagrams removed from the receive queue.
+     * @detail Removes a bounded amount of stale data before START so a continuously
+     *         arriving stream cannot block the worker event loop indefinitely.
+     */
+    quint64 discardPendingDatagrams();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Processes one accepted UDP payload.
+     * @param datagram Complete UDP payload bytes.
+     * @param senderAddress Source IPv4 address.
+     * @param senderPort Source UDP port.
+     * @return none
+     * @detail Decodes complete little-endian counter fields, keeps sequence continuity
+     *         across packets, and reports payload alignment errors.
+     */
+    void processDatagram(const QByteArray &datagram,
+                         const QHostAddress &senderAddress,
+                         quint16 senderPort);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Decodes one little-endian counter value.
+     * @param data Pointer to the first byte of the value.
+     * @param byteCount Value size from one through eight bytes.
+     * @return The received counter represented as an unsigned 64-bit value.
+     * @detail Performs byte-by-byte conversion independently of host byte order and
+     *         alignment.
+     */
+    quint64 decodeLittleEndianCounter(const char *data, int byteCount) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Returns the next counter value with wraparound.
+     * @param value Current counter value.
+     * @return value + 1, or zero after the maximum selected counter value.
+     * @detail Uses the precomputed maximumCounterValue for 8 through 64 bits.
+     */
+    quint64 nextCounterValue(quint64 value) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Formats the shortest modular delta between expected and received values.
+     * @param expectedCounter Expected counter value.
+     * @param receivedCounter Received counter value.
+     * @return Decimal delta text, for example 30, -2, or 1 across wraparound.
+     * @detail Unsigned subtraction is used modulo the selected counter width, and the
+     *         shorter forward or backward distance is reported.
+     */
+    QString counterDeltaText(quint64 expectedCounter,
+                             quint64 receivedCounter) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Updates and emits the current UDP Statistics snapshot.
+     * @param includePeriodicSample true only for the one-second timer tick.
+     * @return none
+     * @detail Calculates rates from byte and packet deltas over the exact monotonic
+     *         interval and optionally accumulates one sample for the twenty-second log.
+     */
+    void updateStatisticsSnapshot(bool includePeriodicSample);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Creates the twenty-second UDP Statistics line when due.
+     * @param none
+     * @return none
+     * @detail Uses total and delta byte and counter values plus minimum, arithmetic mean,
+     *         and maximum of the one-second packet-rate and speed samples.
+     */
+    void emitPeriodicLogLineIfDue();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Internally finalizes an active UDP reception test.
+     * @param reasonText Optional stop reason; an empty string is not logged.
+     * @param reasonIsError true for a red reason entry; false for a black service entry.
+     * @return none
+     * @detail Creates the final snapshot, stops the timer, clears per-test source-report
+     *         state, and emits receptionStateChanged(false).
+     */
+    void stopReceptionInternal(const QString &reasonText,
+                               bool reasonIsError);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Handles a fatal UDP socket failure.
+     * @param reason Complete reason text for the red event-log entry.
+     * @return none
+     * @detail Prevents recursive handling, stops an active test, closes the socket, and
+     *         reports a failed connection state to the GUI.
+     */
+    void handleSocketFailure(const QString &reason);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Closes the UDP receiver socket and emits a disconnected state.
+     * @param causedByFailure true when closure was caused by an error.
+     * @param emitEvent true to emit a normal socket-closed service event.
+     * @return none
+     * @detail Copies endpoint information before clearing internal connection state.
+     */
+    void closeSocket(bool causedByFailure, bool emitEvent);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Formats elapsed test time.
+     * @param elapsedMilliseconds Elapsed duration in milliseconds.
+     * @return HH:MM:SS string with an unlimited number of hours.
+     * @detail Hours are calculated from the full duration and do not wrap after 23.
+     */
+    QString formatElapsedTime(qint64 elapsedMilliseconds) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Formats a nonnegative floating-point rate for logs.
+     * @param value Speed or packet-rate value.
+     * @return String containing at most three digits after the decimal point.
+     * @detail Removes insignificant trailing zeros and returns zero for invalid values.
+     */
+    QString formatRate(double value) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Returns a fixed English description for a UDP socket error.
+     * @param socketError Numeric QAbstractSocket error value.
+     * @return English text independent of the operating-system language.
+     * @detail Maps Qt 5.12 socket errors used by UDP reception.
+     */
+    QString socketErrorText(int socketError) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Emits a normal or error event with an exact timestamp.
+     * @param text Event text without a timestamp.
+     * @param error true for an error; false for a normal entry.
+     * @return none
+     * @detail Creates the HH:MM:SS.mmm timestamp in the UDP worker thread before queued
+     *         delivery to the GUI.
+     */
+    void emitWorkerEvent(const QString &text, bool error);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Emits the current UDP reception state.
+     * @param none
+     * @return none
+     * @detail Centralizes delivery of m_testRunning to the GUI.
+     */
+    void emitReceptionState();
+
+    QUdpSocket *m_udpSocket;
+    QTimer *m_statisticsTimer;
+    QElapsedTimer m_elapsedTimer;
+    PatternSettings m_activePattern;
+    QHostAddress m_expectedSourceAddress;
+    QString m_expectedSourceIp;
+    QString m_localIp;
+    QString m_startTime;
+    QSet<QString> m_reportedUnexpectedSources;
+    quint16 m_listenPort;
+    quint64 m_expectedCounter;
+    quint64 m_lastReceivedCounter;
+    quint64 m_totalPayloadBytes;
+    quint64 m_totalPackets;
+    quint64 m_lastStatisticsBytes;
+    quint64 m_lastStatisticsPackets;
+    qint64 m_lastStatisticsElapsedMs;
+    quint64 m_counterOk;
+    quint64 m_counterErrors;
+    quint64 m_lastPeriodicLogBytes;
+    quint64 m_lastPeriodicCounterOk;
+    quint64 m_lastPeriodicCounterErrors;
+    qint64 m_lastPeriodicLogElapsedMs;
+    double m_periodicMinimumSpeedKbps;
+    double m_periodicMaximumSpeedKbps;
+    double m_periodicSpeedSumKbps;
+    double m_periodicMinimumPacketsPerSecond;
+    double m_periodicMaximumPacketsPerSecond;
+    double m_periodicPacketsPerSecondSum;
+    quint64 m_periodicSampleCount;
+    bool m_initialized;
+    bool m_connectionConfigured;
+    bool m_testRunning;
+    bool m_readContinuationScheduled;
+    bool m_socketOperationInProgress;
+    bool m_handlingSocketFailure;
+    bool m_shuttingDown;
+};
+
+#endif // UDPRXWORKER_H

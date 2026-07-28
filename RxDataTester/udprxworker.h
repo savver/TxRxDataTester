@@ -2,6 +2,7 @@
 #define UDPRXWORKER_H
 
 #include <QAbstractSocket>
+#include <QByteArray>
 #include <QElapsedTimer>
 #include <QHostAddress>
 #include <QObject>
@@ -219,13 +220,36 @@ private slots:
 /*-----------------------------------------------------------------------------*/
 
     /**
-     * @brief Reads and processes pending UDP datagrams.
+     * @brief Handles a real QUdpSocket readyRead notification.
      * @param none
      * @return none
-     * @detail Processes a bounded batch per event-loop callback so Statistics and STOP
-     *         remain responsive under a dense packet stream.
+     * @detail Drains a time-bounded batch only when a datagram is actually pending.
+     *         Empty or stale notifications are counted and recovered by the native-data
+     *         watchdog after a later datagram arrives.
      */
     void handleReadyRead();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Continues draining a large UDP receive backlog.
+     * @param none
+     * @return none
+     * @detail Runs through a queued callback that is separate from the real readyRead
+     *         handler and reads only datagrams confirmed as pending.
+     */
+    void continueReadBatch();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Checks for a stalled UDP read notification.
+     * @param none
+     * @return none
+     * @detail Uses the native socket pending-byte count and Qt pending-datagram state to
+     *         recover reception when data is queued but readyRead no longer arrives.
+     */
+    void checkReceiveWatchdog();
 
 /*-----------------------------------------------------------------------------*/
 
@@ -260,6 +284,35 @@ private slots:
     void handleSocketStateChanged(QAbstractSocket::SocketState state);
 
 private:
+    /**
+     * @brief Identifies why a receive batch was started.
+     * @detail ReadyRead is a real Qt notification, Continuation is a queued backlog
+     *         drain, and Watchdog is an automatic stalled-notification recovery.
+     */
+    enum class ReadTrigger
+    {
+        ReadyRead,
+        Continuation,
+        Watchdog
+    };
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Result of one time-bounded receive batch.
+     * @detail Reports how much work was completed and whether a queued continuation is
+     *         needed without exposing QUdpSocket to the GUI thread.
+     */
+    struct ReadBatchResult
+    {
+        int datagramsRead = 0;
+        bool temporaryEmpty = false;
+        bool budgetReached = false;
+        bool fatalError = false;
+    };
+
+/*-----------------------------------------------------------------------------*/
+
     /**
      * @brief Validated settings of the active UDP pattern.
      * @detail Counter verification depends on counterBytes and initialValue. blockBytes,
@@ -313,11 +366,33 @@ private:
 /*-----------------------------------------------------------------------------*/
 
     /**
-     * @brief Discards every UDP datagram currently queued in the socket.
+     * @brief Drains one time-bounded batch from the UDP socket.
+     * @param trigger Reason why the batch was started.
+     * @return ReadBatchResult describing the completed batch.
+     * @detail Uses one persistent maximum-size payload buffer, avoids empty reads on
+     *         Qt 5.12/Windows, and schedules another callback when the batch budget expires.
+     */
+    ReadBatchResult drainPendingDatagrams(ReadTrigger trigger);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Schedules one queued backlog-drain callback.
+     * @param none
+     * @return none
+     * @detail Prevents duplicate queued continuations and reports an invocation failure
+     *         without stopping the bound receiver socket.
+     */
+    void scheduleReadContinuation();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Discards UDP datagrams currently queued before START.
      * @param none
      * @return Number of datagrams removed from the receive queue.
-     * @detail Removes a bounded amount of stale data before START so a continuously
-     *         arriving stream cannot block the worker event loop indefinitely.
+     * @detail Reuses the persistent receive buffer and applies both a packet limit and a
+     *         monotonic time budget under a continuously arriving stream.
      */
     quint64 discardPendingDatagrams();
 
@@ -325,16 +400,76 @@ private:
 
     /**
      * @brief Processes one accepted UDP payload.
-     * @param datagram Complete UDP payload bytes.
+     * @param data Pointer to the first payload byte in the persistent receive buffer.
+     * @param payloadBytes Number of valid payload bytes.
      * @param senderAddress Source IPv4 address.
      * @param senderPort Source UDP port.
      * @return none
-     * @detail Decodes complete little-endian counter fields, keeps sequence continuity
-     *         across packets, and reports payload alignment errors.
+     * @detail Decodes complete little-endian counter fields without allocating or copying
+     *         a QByteArray for each packet.
      */
-    void processDatagram(const QByteArray &datagram,
+    void processDatagram(const char *data,
+                         int payloadBytes,
                          const QHostAddress &senderAddress,
                          quint16 senderPort);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Queries the number of bytes waiting in the native socket receive queue.
+     * @param succeeded Output flag set true when the native query completed successfully.
+     * @param nativeError Output operating-system error code when the query fails.
+     * @return Pending native bytes, or -1 when the query is unavailable or fails.
+     * @detail Uses FIONREAD on Windows and Unix-like systems only inside the UDP worker
+     *         thread that owns the socket descriptor.
+     */
+    qint64 nativePendingBytes(bool *succeeded, int *nativeError) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Returns the most recent native socket error for the current thread.
+     * @param none
+     * @return WSA error on Windows or errno on Unix-like systems.
+     * @detail Must be called immediately after a failed socket operation before another
+     *         operating-system call can overwrite the thread-local error value.
+     */
+    int lastNativeSocketError() const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Classifies a failed nonblocking UDP read as temporary.
+     * @param socketError Error reported by QUdpSocket.
+     * @param nativeError Native WSA or errno value captured immediately after failure.
+     * @return true for would-block, interrupted, or timeout conditions; otherwise false.
+     * @detail Qt 5.12 on Windows may report an empty nonblocking UDP read as NetworkError,
+     *         so the native error code is checked in addition to the Qt error value.
+     */
+    bool isTemporaryReadFailure(QAbstractSocket::SocketError socketError,
+                                int nativeError) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Resets per-test UDP read-path diagnostics.
+     * @param none
+     * @return none
+     * @detail Clears readyRead, continuation, watchdog, batch-size, and read-error
+     *         counters immediately before a new START.
+     */
+    void resetReadDiagnostics();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Formats current UDP read-path diagnostics.
+     * @param none
+     * @return Semicolon-separated diagnostic fields for service logs.
+     * @detail Includes notification, continuation, watchdog-recovery, and maximum-batch
+     *         counters without changing receiver state.
+     */
+    QString readDiagnosticsText() const;
 
 /*-----------------------------------------------------------------------------*/
 
@@ -482,7 +617,10 @@ private:
 
     QUdpSocket *m_udpSocket;
     QTimer *m_statisticsTimer;
+    QTimer *m_receiveWatchdogTimer;
     QElapsedTimer m_elapsedTimer;
+    QElapsedTimer m_workerUptimeTimer;
+    QByteArray m_receiveBuffer;
     PatternSettings m_activePattern;
     QHostAddress m_expectedSourceAddress;
     QString m_expectedSourceIp;
@@ -510,10 +648,26 @@ private:
     double m_periodicMaximumPacketsPerSecond;
     double m_periodicPacketsPerSecondSum;
     quint64 m_periodicSampleCount;
+    quint64 m_readyReadCalls;
+    quint64 m_emptyReadyReadCalls;
+    quint64 m_continuationCallbacks;
+    quint64 m_watchdogRecoveries;
+    quint64 m_suppressedWatchdogRecoveryEvents;
+    quint64 m_readErrors;
+    quint64 m_datagramsReadByWorker;
+    int m_maximumReadBatch;
+    qint64 m_lastReadyReadMs;
+    qint64 m_lastDatagramReadMs;
+    qint64 m_lastWatchdogRecoveryEventMs;
+    int m_actualReceiveBufferBytes;
     bool m_initialized;
     bool m_connectionConfigured;
     bool m_testRunning;
     bool m_readContinuationScheduled;
+    bool m_readDrainInProgress;
+    bool m_readRequestedDuringDrain;
+    bool m_readAttemptInProgress;
+    bool m_nativeQueryFailureReported;
     bool m_socketOperationInProgress;
     bool m_handlingSocketFailure;
     bool m_shuttingDown;

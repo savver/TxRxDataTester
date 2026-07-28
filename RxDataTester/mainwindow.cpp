@@ -364,7 +364,7 @@ MainWindow::MainWindow(QWidget *parent)
             &MainWindow::handleNeighborLookupProcessError);
 
     initializeLogFile();
-    appendEvent(tr("RxDataTester (v.1.4) started"), EventType::Normal);
+    appendEvent(tr("RxDataTester (v.1.6) started"), EventType::Normal);
 
     if (m_logFile.isOpen())
     {
@@ -2413,7 +2413,7 @@ void MainWindow::prepareShutdown()
     m_udpDisconnectRequestedByUser = false;
 
     saveSettings();
-    appendEvent(tr("RxDataTester (v.1.4) stopped"),
+    appendEvent(tr("RxDataTester (v.1.6) stopped"),
                 EventType::Normal);
     closeLogFile();
 }

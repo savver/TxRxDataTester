@@ -17,7 +17,7 @@
       </size>
     </property>
     <property name="windowTitle">
-      <string>RxDataTester (v.1.4)</string>
+      <string>RxDataTester (v.1.6)</string>
     </property>
     <widget class="QWidget" name="centralWidget">
       <layout class="QVBoxLayout" name="mainVerticalLayout">

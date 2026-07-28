@@ -1,6 +1,9 @@
+#if defined(_WIN32)
+#include <winsock2.h>
+#endif
+
 #include "udprxworker.h"
 
-#include <QByteArray>
 #include <QDateTime>
 #include <QIODevice>
 #include <QMetaObject>
@@ -11,15 +14,25 @@
 
 #include <limits>
 
+#if !defined(_WIN32)
+#include <cerrno>
+#include <sys/ioctl.h>
+#endif
+
 namespace
 {
 constexpr int kStatisticsIntervalMs = 1000;
 constexpr qint64 kPeriodicLogIntervalMs = 20 * 1000;
-constexpr int kMaximumDatagramsPerReadBatch = 256;
-constexpr int kMaximumDatagramsToDiscardBeforeStart = 4096;
-constexpr qint64 kDiscardBeforeStartTimeBudgetMs = 25;
-constexpr int kRequestedReceiveBufferBytes = 4 * 1024 * 1024;
+constexpr int kMaximumDatagramsPerReadBatch = 4096;
+constexpr int kMinimumDatagramsBeforeTimeCheck = 16;
+constexpr qint64 kReadBatchTimeBudgetNs = 2 * 1000 * 1000;
+constexpr int kMaximumDatagramsToDiscardBeforeStart = 16384;
+constexpr qint64 kDiscardBeforeStartTimeBudgetNs = 25 * 1000 * 1000;
+constexpr int kRequestedReceiveBufferBytes = 16 * 1024 * 1024;
 constexpr int kMaximumIpv4UdpPayloadBytes = 65507;
+constexpr int kReceiveWatchdogIntervalMs = 10;
+constexpr qint64 kReceiveStallThresholdMs = 30;
+constexpr qint64 kWatchdogRecoveryLogIntervalMs = 1000;
 }
 
 /*-----------------------------------------------------------------------------*/
@@ -28,13 +41,14 @@ constexpr int kMaximumIpv4UdpPayloadBytes = 65507;
  * @brief Creates the UDP receiver worker object.
  * @param parent Parent QObject; normally omitted before moveToThread().
  * @return none
- * @detail Initializes scalar state only. QUdpSocket and QTimer are created later by
- *         initialize() after the object is moved to its worker thread.
+ * @detail Initializes scalar state only. QUdpSocket, QTimer objects, and the persistent
+ *         receive buffer are created later by initialize() in the worker thread.
  */
 UdpRxWorker::UdpRxWorker(QObject *parent)
     : QObject(parent)
     , m_udpSocket(nullptr)
     , m_statisticsTimer(nullptr)
+    , m_receiveWatchdogTimer(nullptr)
     , m_listenPort(0)
     , m_expectedCounter(0)
     , m_lastReceivedCounter(0)
@@ -56,10 +70,26 @@ UdpRxWorker::UdpRxWorker(QObject *parent)
     , m_periodicMaximumPacketsPerSecond(0.0)
     , m_periodicPacketsPerSecondSum(0.0)
     , m_periodicSampleCount(0)
+    , m_readyReadCalls(0)
+    , m_emptyReadyReadCalls(0)
+    , m_continuationCallbacks(0)
+    , m_watchdogRecoveries(0)
+    , m_suppressedWatchdogRecoveryEvents(0)
+    , m_readErrors(0)
+    , m_datagramsReadByWorker(0)
+    , m_maximumReadBatch(0)
+    , m_lastReadyReadMs(0)
+    , m_lastDatagramReadMs(0)
+    , m_lastWatchdogRecoveryEventMs(-1)
+    , m_actualReceiveBufferBytes(0)
     , m_initialized(false)
     , m_connectionConfigured(false)
     , m_testRunning(false)
     , m_readContinuationScheduled(false)
+    , m_readDrainInProgress(false)
+    , m_readRequestedDuringDrain(false)
+    , m_readAttemptInProgress(false)
+    , m_nativeQueryFailureReported(false)
     , m_socketOperationInProgress(false)
     , m_handlingSocketFailure(false)
     , m_shuttingDown(false)
@@ -72,7 +102,7 @@ UdpRxWorker::UdpRxWorker(QObject *parent)
  * @brief Destroys the UDP receiver worker object.
  * @param none
  * @return none
- * @detail Stops the timer and closes the UDP socket as a safeguard after normal
+ * @detail Stops both timers and closes the UDP socket as a safeguard after normal
  *         shutdown.
  */
 UdpRxWorker::~UdpRxWorker()
@@ -80,6 +110,11 @@ UdpRxWorker::~UdpRxWorker()
     if (m_statisticsTimer != nullptr)
     {
         m_statisticsTimer->stop();
+    }
+
+    if (m_receiveWatchdogTimer != nullptr)
+    {
+        m_receiveWatchdogTimer->stop();
     }
 
     if (m_udpSocket != nullptr
@@ -95,8 +130,8 @@ UdpRxWorker::~UdpRxWorker()
  * @brief Initializes resources owned by the UDP RX worker thread.
  * @param none
  * @return none
- * @detail Creates QUdpSocket and the Statistics timer, connects their signals, and
- *         reports readiness to the GUI.
+ * @detail Creates QUdpSocket, Statistics and watchdog timers, allocates one reusable
+ *         maximum-size IPv4 UDP payload buffer, and reports readiness to the GUI.
  */
 void UdpRxWorker::initialize()
 {
@@ -108,10 +143,17 @@ void UdpRxWorker::initialize()
 
     m_udpSocket = new QUdpSocket(this);
     m_statisticsTimer = new QTimer(this);
+    m_receiveWatchdogTimer = new QTimer(this);
+    m_receiveBuffer.resize(kMaximumIpv4UdpPayloadBytes);
+    m_workerUptimeTimer.start();
 
     m_statisticsTimer->setInterval(kStatisticsIntervalMs);
     m_statisticsTimer->setSingleShot(false);
     m_statisticsTimer->setTimerType(Qt::PreciseTimer);
+
+    m_receiveWatchdogTimer->setInterval(kReceiveWatchdogIntervalMs);
+    m_receiveWatchdogTimer->setSingleShot(false);
+    m_receiveWatchdogTimer->setTimerType(Qt::PreciseTimer);
 
     connect(m_udpSocket,
             &QUdpSocket::readyRead,
@@ -130,6 +172,10 @@ void UdpRxWorker::initialize()
             &QTimer::timeout,
             this,
             &UdpRxWorker::updateStatistics);
+    connect(m_receiveWatchdogTimer,
+            &QTimer::timeout,
+            this,
+            &UdpRxWorker::checkReceiveWatchdog);
 
     m_initialized = true;
     emit receptionStateChanged(false);
@@ -145,8 +191,8 @@ void UdpRxWorker::initialize()
  * @param listenPort Local UDP port on which datagrams are expected.
  * @param localIp Local IPv4 address selected by the operating-system route.
  * @return none
- * @detail Reserves localIp:listenPort exclusively and ignores datagrams received from
- *         other source IP addresses during an active test.
+ * @detail Reserves localIp:listenPort exclusively, requests a large operating-system
+ *         receive buffer, starts the read watchdog, and records actual diagnostics.
  */
 void UdpRxWorker::configureConnection(const QString &expectedSourceIp,
                                       quint16 listenPort,
@@ -204,6 +250,11 @@ void UdpRxWorker::configureConnection(const QString &expectedSourceIp,
         return;
     }
 
+    if (m_receiveBuffer.size() != kMaximumIpv4UdpPayloadBytes)
+    {
+        m_receiveBuffer.resize(kMaximumIpv4UdpPayloadBytes);
+    }
+
     if (m_udpSocket->state() != QAbstractSocket::UnconnectedState)
     {
         m_socketOperationInProgress = true;
@@ -240,30 +291,61 @@ void UdpRxWorker::configureConnection(const QString &expectedSourceIp,
                                  kRequestedReceiveBufferBytes);
     m_socketOperationInProgress = false;
 
+    bool receiveBufferOk = false;
+    m_actualReceiveBufferBytes =
+        m_udpSocket->socketOption(QAbstractSocket::ReceiveBufferSizeSocketOption)
+            .toInt(&receiveBufferOk);
+    if (!receiveBufferOk || m_actualReceiveBufferBytes < 0)
+    {
+        m_actualReceiveBufferBytes = 0;
+    }
+
     m_expectedSourceAddress = sourceAddress;
     m_expectedSourceIp = sourceAddress.toString();
     m_localIp = localAddress.toString();
     m_listenPort = m_udpSocket->localPort();
     m_connectionConfigured = true;
+    m_readContinuationScheduled = false;
+    m_readDrainInProgress = false;
+    m_readRequestedDuringDrain = false;
+    m_readAttemptInProgress = false;
+    m_nativeQueryFailureReported = false;
     m_reportedUnexpectedSources.clear();
+
+    const qint64 nowMs = m_workerUptimeTimer.isValid()
+                             ? m_workerUptimeTimer.elapsed()
+                             : 0;
+    m_lastReadyReadMs = nowMs;
+    m_lastDatagramReadMs = nowMs;
+    resetReadDiagnostics();
+
+    if (m_receiveWatchdogTimer != nullptr)
+    {
+        m_receiveWatchdogTimer->start();
+    }
 
     emit connectionStateChanged(true,
                                 m_expectedSourceIp,
                                 m_listenPort,
                                 m_localIp,
                                 false);
-    emitWorkerEvent(tr("UDP receiver ready: local=%1:%2; expected_source=%3")
-                        .arg(m_localIp)
-                        .arg(m_listenPort)
-                        .arg(m_expectedSourceIp),
-                    false);
+    emitWorkerEvent(
+        tr("UDP receiver ready: local=%1:%2; expected_source=%3; "
+           "requested_rcvbuf=%4; actual_rcvbuf=%5; receive_buffer=%6; "
+           "watchdog=%7 ms; stall_threshold=%8 ms")
+            .arg(m_localIp)
+            .arg(m_listenPort)
+            .arg(m_expectedSourceIp)
+            .arg(kRequestedReceiveBufferBytes)
+            .arg(m_actualReceiveBufferBytes)
+            .arg(m_receiveBuffer.size())
+            .arg(kReceiveWatchdogIntervalMs)
+            .arg(kReceiveStallThresholdMs),
+        false);
 
-    if (m_udpSocket->hasPendingDatagrams() && !m_readContinuationScheduled)
+    if (m_udpSocket->hasPendingDatagrams())
     {
-        m_readContinuationScheduled = true;
-        QMetaObject::invokeMethod(this,
-                                  "handleReadyRead",
-                                  Qt::QueuedConnection);
+        scheduleReadContinuation();
     }
 }
 
@@ -319,8 +401,8 @@ void UdpRxWorker::disconnectConnection()
  * @param initialValue First expected counter value.
  * @param patternDescription Preformatted Pattern description for the event log.
  * @return none
- * @detail Discards datagrams queued before START and verifies each accepted datagram
- *         independently while preserving counter continuity between datagrams.
+ * @detail Discards stale queued datagrams, resets Statistics and read diagnostics, and
+ *         preserves counter continuity between all accepted UDP packets.
  */
 void UdpRxWorker::startReception(int counterBits,
                                  int blockBytes,
@@ -362,21 +444,31 @@ void UdpRxWorker::startReception(int counterBits,
         return;
     }
 
-    discardPendingDatagrams();
+    const quint64 discardedDatagrams = discardPendingDatagrams();
+    if (!m_connectionConfigured
+        || m_udpSocket->state() != QAbstractSocket::BoundState)
+    {
+        emitReceptionState();
+        return;
+    }
+
     resetStatistics(settings);
+    resetReadDiagnostics();
     m_testRunning = true;
     m_statisticsTimer->start();
     emitReceptionState();
-    emitWorkerEvent(tr("UDP START: reception and verification started; %1")
-                        .arg(patternDescription),
-                    false);
+    emitWorkerEvent(
+        tr("UDP START: reception and verification started; %1; "
+           "discarded_before_start=%2; actual_rcvbuf=%3; receive_buffer=%4")
+            .arg(patternDescription)
+            .arg(discardedDatagrams)
+            .arg(m_actualReceiveBufferBytes)
+            .arg(m_receiveBuffer.size()),
+        false);
 
-    if (m_udpSocket->hasPendingDatagrams() && !m_readContinuationScheduled)
+    if (m_udpSocket->hasPendingDatagrams())
     {
-        m_readContinuationScheduled = true;
-        QMetaObject::invokeMethod(this,
-                                  "handleReadyRead",
-                                  Qt::QueuedConnection);
+        scheduleReadContinuation();
     }
 }
 
@@ -386,8 +478,8 @@ void UdpRxWorker::startReception(int counterBits,
  * @brief Stops UDP reception and counter verification.
  * @param none
  * @return none
- * @detail Captures a final Statistics snapshot and leaves the bound UDP socket ready for
- *         another START operation.
+ * @detail Captures a final Statistics snapshot, appends read-path diagnostics, and leaves
+ *         the bound UDP socket ready for another START operation.
  */
 void UdpRxWorker::stopReception()
 {
@@ -398,11 +490,13 @@ void UdpRxWorker::stopReception()
     }
 
     const QString reason =
-        tr("UDP STOP: reception and verification stopped; received %1 payload bytes in %2 packets; counter ok=%3; counter err=%4")
+        tr("UDP STOP: reception and verification stopped; received %1 payload bytes "
+           "in %2 packets; counter ok=%3; counter err=%4; %5")
             .arg(m_totalPayloadBytes)
             .arg(m_totalPackets)
             .arg(m_counterOk)
-            .arg(m_counterErrors);
+            .arg(m_counterErrors)
+            .arg(readDiagnosticsText());
     stopReceptionInternal(reason, false);
 }
 
@@ -412,8 +506,8 @@ void UdpRxWorker::stopReception()
  * @brief Shuts down the UDP RX worker before application exit.
  * @param none
  * @return none
- * @detail Stops active reception, closes the socket and timer, and leaves the object
- *         ready for QThread::quit().
+ * @detail Stops reception, both timers, closes the socket, and releases the persistent
+ *         receive buffer before QThread::quit().
  */
 void UdpRxWorker::shutdown()
 {
@@ -427,13 +521,19 @@ void UdpRxWorker::shutdown()
     if (m_testRunning)
     {
         stopReceptionInternal(
-            tr("UDP reception stopped because the application is closing"),
+            tr("UDP reception stopped because the application is closing; %1")
+                .arg(readDiagnosticsText()),
             false);
     }
 
     if (m_statisticsTimer != nullptr)
     {
         m_statisticsTimer->stop();
+    }
+
+    if (m_receiveWatchdogTimer != nullptr)
+    {
+        m_receiveWatchdogTimer->stop();
     }
 
     if (m_connectionConfigured)
@@ -448,19 +548,64 @@ void UdpRxWorker::shutdown()
         m_socketOperationInProgress = false;
     }
 
+    m_receiveBuffer.clear();
     m_initialized = false;
 }
 
 /*-----------------------------------------------------------------------------*/
 
 /**
- * @brief Reads and processes pending UDP datagrams.
+ * @brief Handles a real QUdpSocket readyRead notification.
  * @param none
  * @return none
- * @detail Processes a bounded batch per event-loop callback so Statistics and STOP remain
- *         responsive under a dense packet stream.
+ * @detail Drains only datagrams confirmed as pending. An empty or stale notification is
+ *         counted without issuing an empty read; the watchdog recovers a later native
+ *         backlog by performing a successful read that rearms Qt notifications.
  */
 void UdpRxWorker::handleReadyRead()
+{
+    if (!m_initialized || m_udpSocket == nullptr)
+    {
+        return;
+    }
+
+    if (m_testRunning && m_readyReadCalls < std::numeric_limits<quint64>::max())
+    {
+        ++m_readyReadCalls;
+    }
+
+    if (m_workerUptimeTimer.isValid())
+    {
+        m_lastReadyReadMs = m_workerUptimeTimer.elapsed();
+    }
+
+    if (m_readDrainInProgress)
+    {
+        m_readRequestedDuringDrain = true;
+        return;
+    }
+
+    const ReadBatchResult result =
+        drainPendingDatagrams(ReadTrigger::ReadyRead);
+    if (m_testRunning
+        && result.datagramsRead == 0
+        && result.temporaryEmpty
+        && m_emptyReadyReadCalls < std::numeric_limits<quint64>::max())
+    {
+        ++m_emptyReadyReadCalls;
+    }
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Continues draining a large UDP receive backlog.
+ * @param none
+ * @return none
+ * @detail Uses a separate queued callback instead of calling the real readyRead handler
+ *         synthetically, and reads only datagrams confirmed as pending.
+ */
+void UdpRxWorker::continueReadBatch()
 {
     m_readContinuationScheduled = false;
 
@@ -469,103 +614,118 @@ void UdpRxWorker::handleReadyRead()
         return;
     }
 
-    int processedDatagrams = 0;
-    while (m_udpSocket->hasPendingDatagrams()
-           && processedDatagrams < kMaximumDatagramsPerReadBatch)
+    if (m_testRunning
+        && m_continuationCallbacks < std::numeric_limits<quint64>::max())
     {
-        const qint64 pendingSize = m_udpSocket->pendingDatagramSize();
-        if (pendingSize < 0
-            || pendingSize > static_cast<qint64>(std::numeric_limits<int>::max()))
-        {
-            handleSocketFailure(
-                tr("UDP read error: invalid pending datagram size %1")
-                    .arg(pendingSize));
-            return;
-        }
-
-        QByteArray datagram;
-        datagram.resize(static_cast<int>(pendingSize));
-        QHostAddress senderAddress;
-        quint16 senderPort = 0;
-        const qint64 bytesRead =
-            m_udpSocket->readDatagram(datagram.data(),
-                                      datagram.size(),
-                                      &senderAddress,
-                                      &senderPort);
-        if (bytesRead < 0)
-        {
-            const int errorValue = static_cast<int>(m_udpSocket->error());
-            const QAbstractSocket::SocketError socketError = m_udpSocket->error();
-            if (socketError == QAbstractSocket::TemporaryError
-                || socketError == QAbstractSocket::SocketTimeoutError)
-            {
-                emitWorkerEvent(tr("UDP read error: %1 (code %2)")
-                                    .arg(socketErrorText(errorValue))
-                                    .arg(errorValue),
-                                true);
-                break;
-            }
-
-            handleSocketFailure(tr("UDP read error: %1 (code %2)")
-                                    .arg(socketErrorText(errorValue))
-                                    .arg(errorValue));
-            return;
-        }
-
-        if (bytesRead < datagram.size())
-        {
-            datagram.resize(static_cast<int>(bytesRead));
-        }
-
-        ++processedDatagrams;
-
-        if (!m_testRunning)
-        {
-            continue;
-        }
-
-        if (!m_expectedSourceAddress.isNull()
-            && senderAddress != m_expectedSourceAddress)
-        {
-            const QString sourceKey = senderAddress.toString();
-            if (!m_reportedUnexpectedSources.contains(sourceKey))
-            {
-                m_reportedUnexpectedSources.insert(sourceKey);
-                emitWorkerEvent(
-                    tr("UDP datagram ignored: expected source IP %1, received from %2:%3")
-                        .arg(m_expectedSourceIp,
-                             sourceKey.isEmpty() ? QStringLiteral("--") : sourceKey)
-                        .arg(senderPort),
-                    true);
-            }
-            continue;
-        }
-
-        const quint64 payloadBytes = static_cast<quint64>(bytesRead);
-        if (std::numeric_limits<quint64>::max() - m_totalPayloadBytes
-            < payloadBytes)
-        {
-            m_totalPayloadBytes = std::numeric_limits<quint64>::max();
-        }
-        else
-        {
-            m_totalPayloadBytes += payloadBytes;
-        }
-
-        if (m_totalPackets < std::numeric_limits<quint64>::max())
-        {
-            ++m_totalPackets;
-        }
-
-        processDatagram(datagram, senderAddress, senderPort);
+        ++m_continuationCallbacks;
     }
 
-    if (m_udpSocket->hasPendingDatagrams() && !m_readContinuationScheduled)
+    if (m_readDrainInProgress)
     {
-        m_readContinuationScheduled = true;
-        QMetaObject::invokeMethod(this,
-                                  "handleReadyRead",
-                                  Qt::QueuedConnection);
+        m_readRequestedDuringDrain = true;
+        return;
+    }
+
+    drainPendingDatagrams(ReadTrigger::Continuation);
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Checks for a stalled UDP read notification.
+ * @param none
+ * @return none
+ * @detail Recovers queued native datagrams when no successful read has occurred for the
+ *         watchdog threshold, while leaving normal readyRead reception untouched.
+ */
+void UdpRxWorker::checkReceiveWatchdog()
+{
+    if (!m_initialized
+        || !m_connectionConfigured
+        || m_udpSocket == nullptr
+        || m_udpSocket->state() != QAbstractSocket::BoundState)
+    {
+        return;
+    }
+
+    bool nativeQuerySucceeded = false;
+    int nativeError = 0;
+    const qint64 nativeBytes =
+        nativePendingBytes(&nativeQuerySucceeded, &nativeError);
+    const bool qtPending = m_udpSocket->hasPendingDatagrams();
+
+    if (!nativeQuerySucceeded && !m_nativeQueryFailureReported)
+    {
+        m_nativeQueryFailureReported = true;
+        emitWorkerEvent(
+            tr("UDP RX diagnostics warning: native FIONREAD query failed; "
+               "native_error=%1; Qt pending-datagram watchdog fallback remains active")
+                .arg(nativeError),
+            false);
+    }
+
+    if (!qtPending && (!nativeQuerySucceeded || nativeBytes <= 0))
+    {
+        return;
+    }
+
+    const qint64 nowMs = m_workerUptimeTimer.isValid()
+                             ? m_workerUptimeTimer.elapsed()
+                             : 0;
+    const qint64 noReadForMs = qMax<qint64>(0, nowMs - m_lastDatagramReadMs);
+    if (noReadForMs < kReceiveStallThresholdMs)
+    {
+        return;
+    }
+
+    if (m_readDrainInProgress)
+    {
+        m_readRequestedDuringDrain = true;
+        return;
+    }
+
+    const ReadBatchResult result =
+        drainPendingDatagrams(ReadTrigger::Watchdog);
+    if (result.datagramsRead <= 0)
+    {
+        return;
+    }
+
+    if (m_testRunning
+        && m_watchdogRecoveries < std::numeric_limits<quint64>::max())
+    {
+        ++m_watchdogRecoveries;
+    }
+
+    if (m_testRunning)
+    {
+        const bool logRecovery =
+            m_lastWatchdogRecoveryEventMs < 0
+            || (nowMs - m_lastWatchdogRecoveryEventMs)
+                   >= kWatchdogRecoveryLogIntervalMs;
+        if (logRecovery)
+        {
+            emitWorkerEvent(
+                tr("UDP RX watchdog recovery: no_read_for=%1 ms; "
+                   "native_next_datagram_bytes=%2; qt_pending=%3; "
+                   "recovered_datagrams=%4; suppressed_recovery_events=%5; %6")
+                    .arg(noReadForMs)
+                    .arg(nativeQuerySucceeded ? QString::number(nativeBytes)
+                                              : QStringLiteral("unknown"))
+                    .arg(qtPending ? QStringLiteral("true")
+                                   : QStringLiteral("false"))
+                    .arg(result.datagramsRead)
+                    .arg(m_suppressedWatchdogRecoveryEvents)
+                    .arg(readDiagnosticsText()),
+                false);
+            m_lastWatchdogRecoveryEventMs = nowMs;
+            m_suppressedWatchdogRecoveryEvents = 0;
+        }
+        else if (m_suppressedWatchdogRecoveryEvents
+                 < std::numeric_limits<quint64>::max())
+        {
+            ++m_suppressedWatchdogRecoveryEvents;
+        }
     }
 }
 
@@ -600,6 +760,7 @@ void UdpRxWorker::updateStatistics()
 void UdpRxWorker::handleSocketError(QAbstractSocket::SocketError error)
 {
     if (error == QAbstractSocket::UnknownSocketError
+        || m_readAttemptInProgress
         || m_socketOperationInProgress
         || m_shuttingDown)
     {
@@ -776,45 +937,302 @@ void UdpRxWorker::resetStatistics(const PatternSettings &settings)
 /*-----------------------------------------------------------------------------*/
 
 /**
- * @brief Discards every UDP datagram currently queued in the socket.
+ * @brief Drains one time-bounded batch from the UDP socket.
+ * @param trigger Reason why the batch was started.
+ * @return ReadBatchResult describing the completed batch.
+ * @detail Reuses the persistent receive buffer, avoids empty reads on Qt 5.12/Windows,
+ *         and yields to the event loop after the packet or time budget is exhausted.
+ */
+UdpRxWorker::ReadBatchResult
+UdpRxWorker::drainPendingDatagrams(ReadTrigger trigger)
+{
+    ReadBatchResult result;
+    if (!m_initialized
+        || m_udpSocket == nullptr
+        || m_receiveBuffer.size() != kMaximumIpv4UdpPayloadBytes
+        || m_udpSocket->state() != QAbstractSocket::BoundState)
+    {
+        return result;
+    }
+
+    if (m_readDrainInProgress)
+    {
+        m_readRequestedDuringDrain = true;
+        return result;
+    }
+
+    m_readDrainInProgress = true;
+    QElapsedTimer batchTimer;
+    batchTimer.start();
+    bool allowNativeWatchdogRead = trigger == ReadTrigger::Watchdog;
+
+    while (true)
+    {
+        bool datagramPending = m_udpSocket->hasPendingDatagrams();
+        if (!datagramPending && allowNativeWatchdogRead)
+        {
+            bool nativeQuerySucceeded = false;
+            int nativeQueryError = 0;
+            const qint64 nativeBytes =
+                nativePendingBytes(&nativeQuerySucceeded, &nativeQueryError);
+            Q_UNUSED(nativeQueryError);
+            datagramPending = nativeQuerySucceeded && nativeBytes > 0;
+        }
+        allowNativeWatchdogRead = false;
+
+        if (!datagramPending)
+        {
+            result.temporaryEmpty = true;
+            break;
+        }
+
+        QHostAddress senderAddress;
+        quint16 senderPort = 0;
+
+        m_readAttemptInProgress = true;
+        const qint64 bytesRead =
+            m_udpSocket->readDatagram(m_receiveBuffer.data(),
+                                      m_receiveBuffer.size(),
+                                      &senderAddress,
+                                      &senderPort);
+        const int nativeReadError = bytesRead < 0
+                                        ? lastNativeSocketError()
+                                        : 0;
+        m_readAttemptInProgress = false;
+
+        if (bytesRead < 0)
+        {
+            const QAbstractSocket::SocketError socketError = m_udpSocket->error();
+            if (isTemporaryReadFailure(socketError, nativeReadError))
+            {
+                result.temporaryEmpty = true;
+                break;
+            }
+
+            if (m_testRunning && m_readErrors < std::numeric_limits<quint64>::max())
+            {
+                ++m_readErrors;
+            }
+
+            const int errorValue = static_cast<int>(socketError);
+            result.fatalError = true;
+            m_readDrainInProgress = false;
+            m_readRequestedDuringDrain = false;
+            handleSocketFailure(
+                tr("UDP read error: %1 (Qt code %2; native code %3)")
+                    .arg(socketErrorText(errorValue))
+                    .arg(errorValue)
+                    .arg(nativeReadError));
+            return result;
+        }
+
+        ++result.datagramsRead;
+        const qint64 nowMs = m_workerUptimeTimer.isValid()
+                                 ? m_workerUptimeTimer.elapsed()
+                                 : 0;
+        m_lastDatagramReadMs = nowMs;
+
+        if (m_testRunning)
+        {
+            if (m_datagramsReadByWorker < std::numeric_limits<quint64>::max())
+            {
+                ++m_datagramsReadByWorker;
+            }
+
+            if (!m_expectedSourceAddress.isNull()
+                && senderAddress != m_expectedSourceAddress)
+            {
+                const QString sourceKey = senderAddress.toString();
+                if (!m_reportedUnexpectedSources.contains(sourceKey))
+                {
+                    m_reportedUnexpectedSources.insert(sourceKey);
+                    emitWorkerEvent(
+                        tr("UDP datagram ignored: expected source IP %1, received from %2:%3")
+                            .arg(m_expectedSourceIp,
+                                 sourceKey.isEmpty() ? QStringLiteral("--")
+                                                     : sourceKey)
+                            .arg(senderPort),
+                        true);
+                }
+            }
+            else
+            {
+                const quint64 payloadBytes = static_cast<quint64>(bytesRead);
+                if (std::numeric_limits<quint64>::max() - m_totalPayloadBytes
+                    < payloadBytes)
+                {
+                    m_totalPayloadBytes = std::numeric_limits<quint64>::max();
+                }
+                else
+                {
+                    m_totalPayloadBytes += payloadBytes;
+                }
+
+                if (m_totalPackets < std::numeric_limits<quint64>::max())
+                {
+                    ++m_totalPackets;
+                }
+
+                processDatagram(m_receiveBuffer.constData(),
+                                static_cast<int>(bytesRead),
+                                senderAddress,
+                                senderPort);
+            }
+        }
+
+        if (result.datagramsRead >= kMaximumDatagramsPerReadBatch)
+        {
+            result.budgetReached = true;
+            break;
+        }
+
+        if (result.datagramsRead >= kMinimumDatagramsBeforeTimeCheck
+            && batchTimer.nsecsElapsed() >= kReadBatchTimeBudgetNs)
+        {
+            result.budgetReached = true;
+            break;
+        }
+    }
+
+    if (m_testRunning && result.datagramsRead > m_maximumReadBatch)
+    {
+        m_maximumReadBatch = result.datagramsRead;
+    }
+
+    const bool readRequestedDuringDrain = m_readRequestedDuringDrain;
+    m_readRequestedDuringDrain = false;
+    m_readDrainInProgress = false;
+
+    if (!result.fatalError
+        && (result.budgetReached
+            || readRequestedDuringDrain
+            || m_udpSocket->hasPendingDatagrams()))
+    {
+        scheduleReadContinuation();
+    }
+
+    return result;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Schedules one queued backlog-drain callback.
+ * @param none
+ * @return none
+ * @detail Prevents duplicate callbacks and keeps synthetic continuation work separate
+ *         from the real QUdpSocket readyRead handler.
+ */
+void UdpRxWorker::scheduleReadContinuation()
+{
+    if (m_readContinuationScheduled
+        || !m_initialized
+        || m_udpSocket == nullptr
+        || m_udpSocket->state() != QAbstractSocket::BoundState)
+    {
+        return;
+    }
+
+    m_readContinuationScheduled = true;
+    const bool invoked =
+        QMetaObject::invokeMethod(this,
+                                  "continueReadBatch",
+                                  Qt::QueuedConnection);
+    if (!invoked)
+    {
+        m_readContinuationScheduled = false;
+        emitWorkerEvent(
+            tr("UDP RX internal error: failed to schedule a receive continuation"),
+            true);
+    }
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Discards UDP datagrams currently queued before START.
  * @param none
  * @return Number of datagrams removed from the receive queue.
- * @detail Removes a bounded amount of stale data before START so a continuously
- *         arriving stream cannot block the worker event loop indefinitely.
+ * @detail Reuses the persistent receive buffer and applies both a packet limit and a
+ *         monotonic time budget under a continuously arriving stream.
  */
 quint64 UdpRxWorker::discardPendingDatagrams()
 {
-    if (m_udpSocket == nullptr)
+    if (m_udpSocket == nullptr
+        || m_receiveBuffer.size() != kMaximumIpv4UdpPayloadBytes
+        || m_udpSocket->state() != QAbstractSocket::BoundState)
     {
         return 0;
     }
 
+    if (m_readDrainInProgress)
+    {
+        m_readRequestedDuringDrain = true;
+        return 0;
+    }
+
+    m_readDrainInProgress = true;
     quint64 discardedDatagrams = 0;
     QElapsedTimer discardTimer;
     discardTimer.start();
 
-    while (m_udpSocket->hasPendingDatagrams()
-           && discardedDatagrams
-                  < static_cast<quint64>(kMaximumDatagramsToDiscardBeforeStart)
-           && discardTimer.elapsed() < kDiscardBeforeStartTimeBudgetMs)
+    while (discardedDatagrams
+               < static_cast<quint64>(kMaximumDatagramsToDiscardBeforeStart)
+           && discardTimer.nsecsElapsed() < kDiscardBeforeStartTimeBudgetNs)
     {
-        const qint64 pendingSize = m_udpSocket->pendingDatagramSize();
-        if (pendingSize < 0
-            || pendingSize > static_cast<qint64>(std::numeric_limits<int>::max()))
+        bool datagramPending = m_udpSocket->hasPendingDatagrams();
+        if (!datagramPending)
+        {
+            bool nativeQuerySucceeded = false;
+            int nativeQueryError = 0;
+            const qint64 nativeBytes =
+                nativePendingBytes(&nativeQuerySucceeded, &nativeQueryError);
+            Q_UNUSED(nativeQueryError);
+            datagramPending = nativeQuerySucceeded && nativeBytes > 0;
+        }
+
+        if (!datagramPending)
         {
             break;
         }
 
-        QByteArray datagram;
-        datagram.resize(static_cast<int>(pendingSize));
-        if (m_udpSocket->readDatagram(datagram.data(), datagram.size()) < 0)
+        m_readAttemptInProgress = true;
+        const qint64 bytesRead =
+            m_udpSocket->readDatagram(m_receiveBuffer.data(),
+                                      m_receiveBuffer.size());
+        const int nativeReadError = bytesRead < 0
+                                        ? lastNativeSocketError()
+                                        : 0;
+        m_readAttemptInProgress = false;
+
+        if (bytesRead < 0)
         {
-            break;
+            const QAbstractSocket::SocketError socketError = m_udpSocket->error();
+            if (isTemporaryReadFailure(socketError, nativeReadError))
+            {
+                break;
+            }
+
+            const int errorValue = static_cast<int>(socketError);
+            m_readDrainInProgress = false;
+            m_readRequestedDuringDrain = false;
+            handleSocketFailure(
+                tr("UDP discard error: %1 (Qt code %2; native code %3)")
+                    .arg(socketErrorText(errorValue))
+                    .arg(errorValue)
+                    .arg(nativeReadError));
+            return discardedDatagrams;
         }
 
         ++discardedDatagrams;
+        if (m_workerUptimeTimer.isValid())
+        {
+            m_lastDatagramReadMs = m_workerUptimeTimer.elapsed();
+        }
     }
 
+    m_readRequestedDuringDrain = false;
+    m_readDrainInProgress = false;
     return discardedDatagrams;
 }
 
@@ -822,39 +1240,41 @@ quint64 UdpRxWorker::discardPendingDatagrams()
 
 /**
  * @brief Processes one accepted UDP payload.
- * @param datagram Complete UDP payload bytes.
+ * @param data Pointer to the first payload byte in the persistent receive buffer.
+ * @param payloadBytes Number of valid payload bytes.
  * @param senderAddress Source IPv4 address.
  * @param senderPort Source UDP port.
  * @return none
- * @detail Decodes complete little-endian counter fields, keeps sequence continuity across
- *         packets, and reports payload alignment errors.
+ * @detail Decodes complete little-endian counter fields without per-packet allocation or
+ *         payload copying and preserves sequence continuity across packet boundaries.
  */
-void UdpRxWorker::processDatagram(const QByteArray &datagram,
+void UdpRxWorker::processDatagram(const char *data,
+                                  int payloadBytes,
                                   const QHostAddress &senderAddress,
                                   quint16 senderPort)
 {
     const int counterBytes = m_activePattern.counterBytes;
-    if (counterBytes <= 0)
+    if (data == nullptr || payloadBytes < 0 || counterBytes <= 0)
     {
         return;
     }
 
     const int completeBytes =
-        (datagram.size() / counterBytes) * counterBytes;
-    const int trailingBytes = datagram.size() - completeBytes;
+        (payloadBytes / counterBytes) * counterBytes;
+    const int trailingBytes = payloadBytes - completeBytes;
     if (trailingBytes > 0)
     {
         emitWorkerEvent(
-            tr("UDP payload alignment error: source=%1:%2; payload=%3 bytes; counter_field=%4 bytes; trailing=%5 bytes")
+            tr("UDP payload alignment error: source=%1:%2; payload=%3 bytes; "
+               "counter_field=%4 bytes; trailing=%5 bytes")
                 .arg(senderAddress.toString())
                 .arg(senderPort)
-                .arg(datagram.size())
+                .arg(payloadBytes)
                 .arg(counterBytes)
                 .arg(trailingBytes),
             true);
     }
 
-    const char *data = datagram.constData();
     for (int offset = 0; offset < completeBytes; offset += counterBytes)
     {
         const quint64 receivedCounter =
@@ -888,6 +1308,174 @@ void UdpRxWorker::processDatagram(const QByteArray &datagram,
 
         m_expectedCounter = nextExpectedCounter;
     }
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Queries the number of bytes waiting in the native socket receive queue.
+ * @param succeeded Output flag set true when the native query completed successfully.
+ * @param nativeError Output operating-system error code when the query fails.
+ * @return Pending native bytes, or -1 when the query fails.
+ * @detail Uses FIONREAD only from the worker thread that owns the QUdpSocket descriptor.
+ */
+qint64 UdpRxWorker::nativePendingBytes(bool *succeeded, int *nativeError) const
+{
+    if (succeeded != nullptr)
+    {
+        *succeeded = false;
+    }
+    if (nativeError != nullptr)
+    {
+        *nativeError = 0;
+    }
+
+    if (m_udpSocket == nullptr || m_udpSocket->socketDescriptor() < 0)
+    {
+        return -1;
+    }
+
+#if defined(_WIN32)
+    u_long availableBytes = 0;
+    const SOCKET nativeSocket =
+        static_cast<SOCKET>(m_udpSocket->socketDescriptor());
+    if (::ioctlsocket(nativeSocket, FIONREAD, &availableBytes) == SOCKET_ERROR)
+    {
+        if (nativeError != nullptr)
+        {
+            *nativeError = ::WSAGetLastError();
+        }
+        return -1;
+    }
+#else
+    int availableBytes = 0;
+    if (::ioctl(static_cast<int>(m_udpSocket->socketDescriptor()),
+                FIONREAD,
+                &availableBytes) != 0)
+    {
+        if (nativeError != nullptr)
+        {
+            *nativeError = errno;
+        }
+        return -1;
+    }
+#endif
+
+    if (succeeded != nullptr)
+    {
+        *succeeded = true;
+    }
+    return static_cast<qint64>(availableBytes);
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Returns the most recent native socket error for the current thread.
+ * @param none
+ * @return WSA error on Windows or errno on Unix-like systems.
+ * @detail The value is captured immediately after a failed readDatagram() call.
+ */
+int UdpRxWorker::lastNativeSocketError() const
+{
+#if defined(_WIN32)
+    return ::WSAGetLastError();
+#else
+    return errno;
+#endif
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Classifies a failed nonblocking UDP read as temporary.
+ * @param socketError Error reported by QUdpSocket.
+ * @param nativeError Native WSA or errno value captured immediately after failure.
+ * @return true for would-block, interrupted, or timeout conditions; otherwise false.
+ * @detail Qt 5.12/Windows can map WSAEWOULDBLOCK from readDatagram() to NetworkError,
+ *         therefore the native code is authoritative for an empty nonblocking read.
+ */
+bool UdpRxWorker::isTemporaryReadFailure(
+    QAbstractSocket::SocketError socketError,
+    int nativeError) const
+{
+    if (socketError == QAbstractSocket::TemporaryError
+        || socketError == QAbstractSocket::SocketTimeoutError)
+    {
+        return true;
+    }
+
+#if defined(_WIN32)
+    return nativeError == WSAEWOULDBLOCK || nativeError == WSAEINTR;
+#else
+    return nativeError == EAGAIN
+           || nativeError == EWOULDBLOCK
+           || nativeError == EINTR;
+#endif
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Resets per-test UDP read-path diagnostics.
+ * @param none
+ * @return none
+ * @detail Clears notification, continuation, watchdog, read-error, datagram, and maximum
+ *         batch counters and restarts activity-gap measurement.
+ */
+void UdpRxWorker::resetReadDiagnostics()
+{
+    m_readyReadCalls = 0;
+    m_emptyReadyReadCalls = 0;
+    m_continuationCallbacks = 0;
+    m_watchdogRecoveries = 0;
+    m_suppressedWatchdogRecoveryEvents = 0;
+    m_readErrors = 0;
+    m_datagramsReadByWorker = 0;
+    m_maximumReadBatch = 0;
+
+    const qint64 nowMs = m_workerUptimeTimer.isValid()
+                             ? m_workerUptimeTimer.elapsed()
+                             : 0;
+    m_lastReadyReadMs = nowMs;
+    m_lastDatagramReadMs = nowMs;
+    m_lastWatchdogRecoveryEventMs = -1;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Formats current UDP read-path diagnostics.
+ * @param none
+ * @return Semicolon-separated diagnostic fields for service logs.
+ * @detail Includes notification counts, watchdog recoveries, read errors, maximum batch,
+ *         and current activity gaps measured by the worker monotonic clock.
+ */
+QString UdpRxWorker::readDiagnosticsText() const
+{
+    const qint64 nowMs = m_workerUptimeTimer.isValid()
+                             ? m_workerUptimeTimer.elapsed()
+                             : 0;
+    const qint64 readyReadGapMs = qMax<qint64>(0, nowMs - m_lastReadyReadMs);
+    const qint64 datagramGapMs =
+        qMax<qint64>(0, nowMs - m_lastDatagramReadMs);
+
+    return QStringLiteral(
+               "ready_read_calls=%1; empty_ready_read_calls=%2; "
+               "read_continuations=%3; watchdog_recoveries=%4; "
+               "suppressed_watchdog_events=%5; read_errors=%6; "
+               "worker_datagrams=%7; max_read_batch=%8; "
+               "ready_read_gap_ms=%9; datagram_gap_ms=%10")
+        .arg(m_readyReadCalls)
+        .arg(m_emptyReadyReadCalls)
+        .arg(m_continuationCallbacks)
+        .arg(m_watchdogRecoveries)
+        .arg(m_suppressedWatchdogRecoveryEvents)
+        .arg(m_readErrors)
+        .arg(m_datagramsReadByWorker)
+        .arg(m_maximumReadBatch)
+        .arg(readyReadGapMs)
+        .arg(datagramGapMs);
 }
 
 /*-----------------------------------------------------------------------------*/
@@ -1105,7 +1693,8 @@ void UdpRxWorker::emitPeriodicLogLineIfDue()
                        "curr_counter=%5, counter_ok=%6, delta_counter_ok=%7, "
                        "counter_err=%8, delta_counter_err=%9, "
                        "min_packet/s=%10, avrg_packets/s=%11, max_packet/s=%12, "
-                       "min_speed_Kb/s=%13, avrg_speed_Kb/s=%14, max_speed_Kb/s=%15")
+                       "min_speed_Kb/s=%13, avrg_speed_Kb/s=%14, max_speed_Kb/s=%15, "
+                       "%16")
             .arg(QDateTime::currentDateTime().toString(
                 QStringLiteral("HH:mm:ss.zzz")))
             .arg(formatElapsedTime(elapsedMilliseconds))
@@ -1121,7 +1710,8 @@ void UdpRxWorker::emitPeriodicLogLineIfDue()
             .arg(formatRate(m_periodicMaximumPacketsPerSecond))
             .arg(formatRate(m_periodicMinimumSpeedKbps))
             .arg(formatRate(averageSpeedKbps))
-            .arg(formatRate(m_periodicMaximumSpeedKbps));
+            .arg(formatRate(m_periodicMaximumSpeedKbps))
+            .arg(readDiagnosticsText());
 
     emit periodicLogLineReady(line);
 
@@ -1196,11 +1786,13 @@ void UdpRxWorker::handleSocketFailure(const QString &reason)
     if (m_testRunning)
     {
         completeReason +=
-            tr("; reception stopped; received %1 payload bytes in %2 packets; counter ok=%3; counter err=%4")
+            tr("; reception stopped; received %1 payload bytes in %2 packets; "
+               "counter ok=%3; counter err=%4; %5")
                 .arg(m_totalPayloadBytes)
                 .arg(m_totalPackets)
                 .arg(m_counterOk)
-                .arg(m_counterErrors);
+                .arg(m_counterErrors)
+                .arg(readDiagnosticsText());
         stopReceptionInternal(QString(), false);
     }
 
@@ -1224,6 +1816,11 @@ void UdpRxWorker::closeSocket(bool causedByFailure, bool emitEvent)
     const quint16 listenPort = m_listenPort;
     const QString localIp = m_localIp;
 
+    if (m_receiveWatchdogTimer != nullptr)
+    {
+        m_receiveWatchdogTimer->stop();
+    }
+
     if (m_udpSocket != nullptr)
     {
         m_socketOperationInProgress = true;
@@ -1236,7 +1833,12 @@ void UdpRxWorker::closeSocket(bool causedByFailure, bool emitEvent)
     m_expectedSourceIp.clear();
     m_localIp.clear();
     m_listenPort = 0;
+    m_actualReceiveBufferBytes = 0;
     m_readContinuationScheduled = false;
+    m_readDrainInProgress = false;
+    m_readRequestedDuringDrain = false;
+    m_readAttemptInProgress = false;
+    m_nativeQueryFailureReported = false;
     m_reportedUnexpectedSources.clear();
 
     emit connectionStateChanged(false,

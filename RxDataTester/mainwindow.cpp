@@ -364,7 +364,7 @@ MainWindow::MainWindow(QWidget *parent)
             &MainWindow::handleNeighborLookupProcessError);
 
     initializeLogFile();
-    appendEvent(tr("RxDataTester (v.1.6) started"), EventType::Normal);
+    appendEvent(tr("RxDataTester (v.1.7) started"), EventType::Normal);
 
     if (m_logFile.isOpen())
     {
@@ -1818,7 +1818,8 @@ void MainWindow::initializeRxThread()
  * @param none
  * @return none
  * @detail Moves UdpRxWorker to QThread, connects all queued commands and worker
- *         replies, and starts the thread after all connections are configured.
+ *         replies, and starts the UDP receive thread with HighPriority after all
+ *         connections are configured.
  */
 void MainWindow::initializeUdpRxThread()
 {
@@ -1887,7 +1888,7 @@ void MainWindow::initializeUdpRxThread()
             &MainWindow::writeLogLine,
             Qt::QueuedConnection);
 
-    m_udpRxThread.start();
+    m_udpRxThread.start(QThread::HighPriority);
 }
 
 /*-----------------------------------------------------------------------------*/
@@ -2413,7 +2414,7 @@ void MainWindow::prepareShutdown()
     m_udpDisconnectRequestedByUser = false;
 
     saveSettings();
-    appendEvent(tr("RxDataTester (v.1.6) stopped"),
+    appendEvent(tr("RxDataTester (v.1.7) stopped"),
                 EventType::Normal);
     closeLogFile();
 }

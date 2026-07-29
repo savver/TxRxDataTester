@@ -1,65 +1,83 @@
-# RxDataTester (v.1.6)
+# RxDataTester (v.1.7)
 
 RxDataTester is a Qt 5.12 + qmake utility that receives a binary counter
 pattern through COM or UDP and verifies that counter values increase
 continuously. The GUI, source comments, EVENTS messages, and text logs are
 entirely in English.
 
-## Version 1.6 high-rate UDP receiver
+## Version 1.7 high-rate UDP receive pipeline
 
-Version 1.6 keeps the persistent 65,507-byte payload buffer, bounded batch
-processing, 16 MiB receive buffer request, and native-data watchdog introduced
-in version 1.5. It fixes a START failure specific to Qt 5.12 on Windows.
+Version 1.7 changes the UDP hot path from direct receive-and-verify processing
+into two bounded stages inside the dedicated UDP worker thread:
 
-Version 1.5 deliberately called `readDatagram()` once even when the UDP queue
-was empty, intending to rearm a stale `readyRead` notification. On Windows, an
-empty nonblocking `WSARecvFrom` returns `WSAEWOULDBLOCK`; Qt 5.12 can expose that
-result as `QAbstractSocket::NetworkError` instead of `TemporaryError`. The START
-cleanup therefore produced `UDP discard error: network error (code 7)` and
-closed an otherwise healthy bound socket.
+```text
+QUdpSocket / native receive queue
+        |
+        | persistent 65,507-byte socket buffer
+        v
+preallocated packet ring
+        |
+        | zero-delay bounded processing timer
+        v
+little-endian counter verification and Statistics
+```
 
-The version 1.6 receive policy is:
+The changes are intended for dense bursts and sustained high packet rates:
 
-- never issue an unconditional empty `readDatagram()` call;
-- read immediately from a real `readyRead` callback only when Qt reports a
-  pending datagram;
-- use native `FIONREAD` as a watchdog fallback when Qt notification delivery
-  stalls but data is present in the operating-system queue;
-- after native data is confirmed, a successful `readDatagram()` both consumes
-  the packet and rearms Qt read notifications;
-- classify `WSAEWOULDBLOCK`, `EAGAIN`, `EWOULDBLOCK`, and interrupted reads as
-  temporary races instead of fatal socket failures;
-- include both Qt and native error codes in a genuine UDP read or discard error.
+- one reusable 65,507-byte `QByteArray` remains the only socket read buffer;
+- accepted datagrams are copied into a preallocated fixed-slot packet ring;
+- the packet ring uses a bounded 32 MiB memory budget and up to 16,384 slots;
+- no `QByteArray` is allocated, resized, or destroyed for each received packet;
+- socket draining and counter verification have separate time budgets;
+- a real `readyRead` notification still starts reception immediately;
+- an independent 1 ms receive pump checks Qt and native `FIONREAD` state and
+  drains data even if Qt 5.12/Windows stops delivering `readyRead` callbacks;
+- a missing `readyRead` stream is considered stalled after 5 ms, but reception
+  does not wait for that threshold: the pump reads pending data on every tick;
+- the UDP worker thread is started with `QThread::HighPriority`;
+- the system UDP receive buffer request remains 16 MiB and its actual value is
+  read back and logged;
+- socket receive batches are limited to approximately 0.75 ms;
+- packet verification batches are limited to approximately 1 ms;
+- if the packet ring becomes full, the oldest packet is verified immediately to
+  preserve FIFO order and make room without intentionally dropping the new
+  packet;
+- STOP, DISCONNECT, socket failure, and application shutdown process packets
+  already present in the internal ring before final Statistics are captured;
+- the 20-second log and STOP diagnostics now include packet-ring depth,
+  receive-pump recoveries, processing load, receive and processing batch times,
+  queue pressure, and processed-datagram totals.
 
-The high-rate optimizations remain:
-
-- one reusable 65,507-byte `QByteArray` is allocated in the UDP worker thread;
-  no payload array is allocated or resized for every datagram;
-- a real `QUdpSocket::readyRead` notification is handled immediately;
-- queued backlog processing uses a separate `continueReadBatch()` slot;
-- each receive pass is limited to approximately 2 ms or 4,096 datagrams, then
-  yields to the worker event loop so STOP and Statistics remain responsive;
-- a 10 ms watchdog checks both Qt pending-datagram state and native `FIONREAD`;
-  if data remains queued and no datagram has been read for 30 ms, reception is
-  drained automatically;
-- watchdog recovery EVENTS are rate-limited;
-- the requested receive buffer is 16 MiB and the actual accepted value is
-  written to EVENTS and the text log;
-- 20-second log lines and STOP include readyRead, continuation, watchdog, read
-  error, datagram, maximum-batch, and activity-gap diagnostics.
+The packet-ring slot size is at least 2,048 bytes and grows to the configured
+`block, bytes` value when larger. For example, a 1,280-byte Pattern normally
+creates 16,384 slots and approximately 32 MiB of queue storage. A packet larger
+than the configured slot is handled through an ordered direct-processing
+fallback and counted in `oversize_direct` diagnostics.
 
 A typical connection entry is:
 
 ```text
-UDP receiver ready: local=192.168.1.2:8890; expected_source=192.168.1.3; requested_rcvbuf=16777216; actual_rcvbuf=16777216; receive_buffer=65507; watchdog=10 ms; stall_threshold=30 ms
+UDP receiver ready: local=192.168.1.2:8890; expected_source=192.168.1.3; requested_rcvbuf=16777216; actual_rcvbuf=16777216; receive_buffer=65507; receive_pump=1 ms; stall_threshold=5 ms
 ```
 
-If the watchdog detects queued native data after Qt notification delivery has
-stalled, it records a black service event and resumes draining:
+A typical START entry includes the allocated ring:
 
 ```text
-UDP RX watchdog recovery: no_read_for=37 ms; native_next_datagram_bytes=1280; qt_pending=true; recovered_datagrams=12; suppressed_recovery_events=0; ready_read_calls=4412; empty_ready_read_calls=1; read_continuations=18; watchdog_recoveries=1; suppressed_watchdog_events=0; read_errors=0; worker_datagrams=4423; max_read_batch=256; ready_read_gap_ms=37; datagram_gap_ms=0
+UDP START: reception and verification started; Pattern: counter=32 bits; init=0; block=1280 bytes; Togeth=16; period=1 ms; values/packet=320; bo=LE; discarded_before_start=0; actual_rcvbuf=16777216; receive_buffer=65507; packet_queue_slots=16384; packet_queue_slot_bytes=2048; packet_queue_memory=33554432
 ```
+
+If Qt notification delivery stalls while data is still arriving, the service
+log records a rate-limited receive-pump recovery and reception continues:
+
+```text
+UDP RX receive-pump recovery: no_ready_read_for=7 ms; native_pending_bytes=10240; qt_pending=false; received_datagrams=8; queued_datagrams=8; directly_processed=0; suppressed_recovery_events=0; ...
+```
+
+`rx, bytes` and `packets/s` count payloads accepted from the configured source
+IP. Counter verification is performed from the internal FIFO ring, so under an
+extreme temporary backlog `counter, ok`, `counter, err`, and `curr_count` may
+lag the receive totals briefly. `queue_depth` and `max_queue_depth` show that
+lag explicitly.
 
 ## Build
 
@@ -107,13 +125,14 @@ COM RX thread
 |- counter verification
 |- COM Statistics
 
-UDP RX thread
+UDP RX high-priority thread
 |- UdpRxWorker
 |- persistent bound QUdpSocket
-|- persistent maximum-size payload buffer
-|- immediate readyRead processing
-|- bounded queued backlog draining
-|- native receive watchdog
+|- persistent maximum-size socket buffer
+|- immediate readyRead socket draining
+|- independent 1 ms native/Qt receive pump
+|- preallocated fixed-slot packet ring
+|- bounded packet-processing timer
 |- counter verification across datagrams
 |- UDP Statistics and 20-second log snapshots
 ```
@@ -159,7 +178,7 @@ CONNECT performs these steps:
 5. If ping succeeds, bind a persistent UDP socket to `our IP:Port`.
 6. Request a 16 MiB operating-system receive buffer and read back its actual
    value.
-7. Start the receive watchdog.
+7. Start the 1 ms receive pump that is independent of `readyRead`.
 8. Try to resolve `dest MAC` through the neighbor table.
 
 A successful ping confirms IP reachability, not that the transmitter has
@@ -185,10 +204,12 @@ UDP Pattern contains:
 - START and STOP.
 
 When START is pressed, a bounded amount of data already queued before START is
-discarded. The expected counter is initialized from `init value`. Each accepted
-datagram from the configured source IP is decoded independently as a sequence
-of little-endian unsigned counter values. Counter continuity is preserved
-between adjacent UDP datagrams.
+discarded, and the fixed-slot packet ring is allocated from the configured
+`block, bytes` value. The expected counter is initialized from `init value`.
+Socket callbacks copy accepted datagrams from the configured source IP into the
+ring, and a separate bounded processing callback decodes little-endian unsigned
+counter values in FIFO order. Counter continuity is preserved between adjacent
+UDP datagrams.
 
 For a 32-bit counter and a 128-byte payload, one datagram contains:
 
@@ -245,7 +266,7 @@ While UDP reception is active, an additional line is written only to the text
 log approximately every 20 seconds:
 
 ```text
-19:44:06.361, time=00:00:20, rx_bytes=1782656, delta_rx_bytes=1782656, curr_counter=445689, counter_ok=445690, delta_counter_ok=445690, counter_err=0, delta_counter_err=0, min_packet/s=4078, avrg_packets/s=4352, max_packet/s=4788, min_speed_Kb/s=522, avrg_speed_Kb/s=544.18, max_speed_Kb/s=621, ready_read_calls=19984; empty_ready_read_calls=2; read_continuations=31; watchdog_recoveries=1; suppressed_watchdog_events=0; read_errors=0; worker_datagrams=20000; max_read_batch=184; ready_read_gap_ms=0; datagram_gap_ms=0
+19:44:06.361, time=00:00:20, rx_bytes=25600000, delta_rx_bytes=25600000, curr_counter=6399999, counter_ok=6400000, delta_counter_ok=6400000, counter_err=0, delta_counter_err=0, min_packet/s=997, avrg_packets/s=999.8, max_packet/s=1002, min_speed_Kb/s=10209, avrg_speed_Kb/s=10237.9, max_speed_Kb/s=10260, ready_read_calls=18000; empty_ready_read_calls=3; read_continuations=20; receive_pump_calls=19984; receive_pump_recoveries=2; suppressed_receive_pump_events=0; read_errors=0; worker_datagrams=20000; processed_datagrams=20000; processing_callbacks=15000; queue_depth=0; max_queue_depth=64; queue_capacity=16384; queue_pressure_events=0; queue_drops=0; oversize_direct=0; max_read_batch=128; max_processing_batch=96; socket_read_time_us=420000; processing_time_us=790000; max_socket_batch_us=748; max_processing_batch_us=996; processing_load_pct=3.95; ready_read_gap_ms=0; datagram_gap_ms=0; native_pending_bytes=0; qt_pending=false
 ```
 
 The minimum, average, and maximum packet rates and speeds are calculated from
@@ -253,9 +274,13 @@ the one-second values displayed during the current 20-second interval. The
 average is the arithmetic mean of those samples. Delta counters are measured
 from the previous 20-second line.
 
-The appended read diagnostics make it possible to distinguish normal packet
-loss from a stalled notification, a queued receive backlog, or a socket read
-error.
+The appended diagnostics make it possible to distinguish normal packet loss
+from a stalled notification, an internal processing backlog, packet-ring
+pressure, or a socket read error. `processing_load_pct` is the fraction of the
+latest Statistics interval spent inside bounded packet-verification callbacks;
+`queue_depth` is the current internal backlog at the moment the line is built.
+`native_pending_bytes` and `qt_pending` show whether data is still waiting in
+the operating-system or Qt socket path when the Statistics line is created.
 
 ## EVENTS and text logs
 

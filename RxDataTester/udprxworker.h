@@ -8,14 +8,16 @@
 #include <QObject>
 #include <QSet>
 #include <QString>
+#include <QVector>
 
 class QTimer;
 class QUdpSocket;
 
 /**
  * @brief UDP counter-pattern reception worker.
- * @detail Runs in a dedicated QThread and owns QUdpSocket, datagram reception,
- *         little-endian counter verification, and UDP Statistics calculations.
+ * @detail Runs in a dedicated high-priority QThread. A fast socket receive stage copies
+ *         datagrams into a preallocated packet ring, while a separate bounded processing
+ *         stage verifies the little-endian counter and calculates UDP Statistics.
  */
 class UdpRxWorker final : public QObject
 {
@@ -142,8 +144,8 @@ public slots:
      * @brief Initializes resources owned by the UDP RX worker thread.
      * @param none
      * @return none
-     * @detail Creates QUdpSocket and the Statistics timer, connects their signals, and
-     *         reports readiness to the GUI.
+     * @detail Creates QUdpSocket, receive-pump, packet-processing, and Statistics timers,
+     *         allocates the persistent socket buffer, and reports readiness to the GUI.
      */
     void initialize();
 
@@ -225,7 +227,7 @@ private slots:
      * @return none
      * @detail Drains a time-bounded batch only when a datagram is actually pending.
      *         Empty or stale notifications are counted and recovered by the native-data
-     *         watchdog after a later datagram arrives.
+     *         receive pump after a later datagram arrives.
      */
     void handleReadyRead();
 
@@ -243,13 +245,25 @@ private slots:
 /*-----------------------------------------------------------------------------*/
 
     /**
-     * @brief Checks for a stalled UDP read notification.
+     * @brief Pumps pending datagrams independently of readyRead notifications.
      * @param none
      * @return none
-     * @detail Uses the native socket pending-byte count and Qt pending-datagram state to
-     *         recover reception when data is queued but readyRead no longer arrives.
+     * @detail Runs every millisecond, checks both Qt and native socket state, and drains a
+     *         bounded batch whenever data is queued. This keeps reception alive even after
+     *         Qt 5.12/Windows stops delivering readyRead notifications.
      */
-    void checkReceiveWatchdog();
+    void serviceReceivePump();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Processes a bounded batch from the preallocated packet ring.
+     * @param none
+     * @return none
+     * @detail Counter verification is separated from socket draining so the operating-system
+     *         receive queue can be emptied quickly during dense packet bursts.
+     */
+    void processPacketQueue();
 
 /*-----------------------------------------------------------------------------*/
 
@@ -286,14 +300,14 @@ private slots:
 private:
     /**
      * @brief Identifies why a receive batch was started.
-     * @detail ReadyRead is a real Qt notification, Continuation is a queued backlog
-     *         drain, and Watchdog is an automatic stalled-notification recovery.
+     * @detail ReadyRead is a real Qt notification, Continuation is a queued socket-drain
+     *         callback, and ReceivePump is the periodic notification-independent fallback.
      */
     enum class ReadTrigger
     {
         ReadyRead,
         Continuation,
-        Watchdog
+        ReceivePump
     };
 
 /*-----------------------------------------------------------------------------*/
@@ -306,6 +320,8 @@ private:
     struct ReadBatchResult
     {
         int datagramsRead = 0;
+        int datagramsQueued = 0;
+        int datagramsProcessedDirectly = 0;
         bool temporaryEmpty = false;
         bool budgetReached = false;
         bool fatalError = false;
@@ -369,8 +385,8 @@ private:
      * @brief Drains one time-bounded batch from the UDP socket.
      * @param trigger Reason why the batch was started.
      * @return ReadBatchResult describing the completed batch.
-     * @detail Uses one persistent maximum-size payload buffer, avoids empty reads on
-     *         Qt 5.12/Windows, and schedules another callback when the batch budget expires.
+     * @detail Uses one persistent maximum-size socket buffer, copies accepted packets into
+     *         the preallocated ring, and yields when the receive time budget expires.
      */
     ReadBatchResult drainPendingDatagrams(ReadTrigger trigger);
 
@@ -395,6 +411,101 @@ private:
      *         monotonic time budget under a continuously arriving stream.
      */
     quint64 discardPendingDatagrams();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Allocates the preallocated packet ring for a new START operation.
+     * @param expectedPayloadBytes Payload size configured in Pattern.
+     * @param errorText Output pointer for an allocation or size error.
+     * @return true when the packet ring is ready; otherwise false.
+     * @detail Uses a bounded memory budget, fixed-size slots, and no per-datagram heap
+     *         allocation in the high-rate receive path.
+     */
+    bool configurePacketQueue(int expectedPayloadBytes, QString *errorText);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Clears packet-ring indices without releasing preallocated storage.
+     * @param none
+     * @return none
+     * @detail Stops pending processing and resets head, tail, and depth for a new test.
+     */
+    void clearPacketQueue();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Copies one received payload into the packet ring.
+     * @param data Pointer to the received payload.
+     * @param payloadBytes Number of valid payload bytes.
+     * @param senderPort Source UDP port retained for diagnostic messages.
+     * @return true when the payload was queued; otherwise false.
+     * @detail If the ring is full, the oldest packet is processed synchronously to preserve
+     *         sequence order and make one slot available without dropping the new packet.
+     */
+    bool enqueueDatagram(const char *data, int payloadBytes, quint16 senderPort);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Schedules packet-ring processing through a zero-delay timer.
+     * @param none
+     * @return none
+     * @detail Avoids duplicate scheduling while allowing socket receive callbacks to return
+     *         quickly to the worker event loop.
+     */
+    void schedulePacketProcessing();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Processes packets already stored in the packet ring.
+     * @param timeBudgetNs Maximum processing time; ignored when drainCompletely is true.
+     * @param maximumDatagrams Maximum packet count; ignored when drainCompletely is true.
+     * @param drainCompletely true to empty the ring before returning.
+     * @return Number of processed packets.
+     * @detail Preserves FIFO order and records processing time, callback count, maximum batch,
+     *         and queue-depth diagnostics.
+     */
+    int processQueuedDatagrams(qint64 timeBudgetNs,
+                               int maximumDatagrams,
+                               bool drainCompletely);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Adds one packet-verification work item to processing diagnostics.
+     * @param elapsedNs Time spent in the processing work item in nanoseconds.
+     * @param processedDatagrams Number of packets verified by the work item.
+     * @return none
+     * @detail Accounts both scheduled processing batches and inline FIFO-preserving work
+     *         performed when the packet ring is full or an oversized payload is received.
+     */
+    void recordProcessingWork(qint64 elapsedNs, int processedDatagrams);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Processes and removes one oldest packet from the ring.
+     * @param none
+     * @return true when one packet was processed; otherwise false.
+     * @detail The packet payload remains in preallocated storage and is never copied into a
+     *         temporary QByteArray.
+     */
+    bool processOneQueuedDatagram();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Reports sustained pressure on the internal packet ring.
+     * @param none
+     * @return none
+     * @detail Rate-limits service messages to avoid adding GUI or disk load during a dense
+     *         UDP stream.
+     */
+    void reportQueuePressure();
 
 /*-----------------------------------------------------------------------------*/
 
@@ -455,8 +566,8 @@ private:
      * @brief Resets per-test UDP read-path diagnostics.
      * @param none
      * @return none
-     * @detail Clears readyRead, continuation, watchdog, batch-size, and read-error
-     *         counters immediately before a new START.
+     * @detail Clears readyRead, receive-pump, queue, processing-time, batch-size, and
+     *         read-error counters immediately before a new START.
      */
     void resetReadDiagnostics();
 
@@ -466,8 +577,8 @@ private:
      * @brief Formats current UDP read-path diagnostics.
      * @param none
      * @return Semicolon-separated diagnostic fields for service logs.
-     * @detail Includes notification, continuation, watchdog-recovery, and maximum-batch
-     *         counters without changing receiver state.
+     * @detail Includes notification, receive-pump, queue-depth, processing-load, and
+     *         maximum-batch counters without changing receiver state.
      */
     QString readDiagnosticsText() const;
 
@@ -617,10 +728,14 @@ private:
 
     QUdpSocket *m_udpSocket;
     QTimer *m_statisticsTimer;
-    QTimer *m_receiveWatchdogTimer;
+    QTimer *m_receivePumpTimer;
+    QTimer *m_packetProcessingTimer;
     QElapsedTimer m_elapsedTimer;
     QElapsedTimer m_workerUptimeTimer;
     QByteArray m_receiveBuffer;
+    QByteArray m_packetQueueStorage;
+    QVector<quint32> m_packetQueueLengths;
+    QVector<quint16> m_packetQueueSenderPorts;
     PatternSettings m_activePattern;
     QHostAddress m_expectedSourceAddress;
     QString m_expectedSourceIp;
@@ -651,20 +766,43 @@ private:
     quint64 m_readyReadCalls;
     quint64 m_emptyReadyReadCalls;
     quint64 m_continuationCallbacks;
-    quint64 m_watchdogRecoveries;
-    quint64 m_suppressedWatchdogRecoveryEvents;
+    quint64 m_receivePumpCalls;
+    quint64 m_receivePumpRecoveries;
+    quint64 m_suppressedReceivePumpEvents;
     quint64 m_readErrors;
     quint64 m_datagramsReadByWorker;
+    quint64 m_datagramsProcessed;
+    quint64 m_processingCallbacks;
+    quint64 m_queuePressureEvents;
+    quint64 m_queueDroppedDatagrams;
+    quint64 m_oversizeDirectDatagrams;
+    quint64 m_totalSocketReadTimeNs;
+    quint64 m_totalProcessingTimeNs;
+    quint64 m_lastStatisticsProcessingTimeNs;
     int m_maximumReadBatch;
+    int m_maximumProcessingBatch;
+    qint64 m_maximumSocketReadBatchNs;
+    qint64 m_maximumProcessingBatchNs;
+    qint64 m_lastProcessingLoadPercentTimes1000;
     qint64 m_lastReadyReadMs;
     qint64 m_lastDatagramReadMs;
-    qint64 m_lastWatchdogRecoveryEventMs;
+    qint64 m_lastReceivePumpEventMs;
+    qint64 m_lastQueuePressureEventMs;
+    int m_packetQueueSlotBytes;
+    int m_packetQueueCapacity;
+    int m_packetQueueHead;
+    int m_packetQueueTail;
+    int m_packetQueueDepth;
+    int m_maximumPacketQueueDepth;
     int m_actualReceiveBufferBytes;
     bool m_initialized;
     bool m_connectionConfigured;
     bool m_testRunning;
     bool m_readContinuationScheduled;
+    bool m_packetProcessingScheduled;
+    bool m_receivePumpFallbackActive;
     bool m_readDrainInProgress;
+    bool m_packetProcessingInProgress;
     bool m_readRequestedDuringDrain;
     bool m_readAttemptInProgress;
     bool m_nativeQueryFailureReported;

@@ -7,11 +7,7 @@ TxDataTester and RxDataTester generate, receive, and verify data patterns, such 
 * UDP network connections;
 * custom MCU and FPGA-based devices.
 
-When selecting a new communication adapter, it is often necessary to verify whether it loses data under a continuous high-rate data stream.
-
-Custom devices based on microcontrollers or FPGAs also require long-duration testing with automatic verification of the received data.
-
-TxDataTester and RxDataTester were developed for these purposes.
+When selecting a new communication adapter, it is often necessary to verify whether it loses data under a continuous high-rate data stream. Custom devices based on microcontrollers or FPGAs also require long-duration testing with automatic verification of the received data. TxDataTester and RxDataTester were developed for these purposes.
 
 ## Platform
 
@@ -33,7 +29,6 @@ TxDataTester and RxDataTester were developed for these purposes.
 ## How to Use
 
 Install Qt Creator, extract the required DLL files into the same directory as the executable file and run the application.
-
 Complete application release packages will be published later.
 
 ## Examples

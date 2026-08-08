@@ -1,27 +1,31 @@
-# TxDataTester (v.1.7)
+# TxDataTester (v.1.9)
 
-TxDataTester is a Qt 5.12 test-pattern transmitter for COM and UDP transport.
-The project uses qmake and C++11. CMake is not required.
+TxDataTester is a Qt 5.12 test-pattern generator for COM, UDP, and binary FILE
+output. The project uses qmake and C++11; CMake is not required.
 
-The source code, Doxygen comments, GUI messages, EVENTS entries, and text-log
+All source comments, README text, GUI messages, EVENTS entries, and text-log
 messages are written in English.
 
-## Version 1.7 changes
+## Version 1.9 changes
 
-Version 1.7 completes the UDP transmitter tab:
+Version 1.9 implements the FILE generator that was introduced as a GUI-only tab
+in v.1.8.
 
-- one short-timeout IPv4 ping is used by `CONNECT` instead of four requests;
-- the COM and UDP tabs are mutually locked while one transport is active;
-- the UDP `Pattern` group contains the new `Togeth` burst-size field;
-- `Period, ms` is placed on the third Pattern row opposite `SINGLE`;
-- UDP `Statistics` contains `packets/s`, with `speed, Kb/s` on the fourth row;
-- UDP packet generation and `QUdpSocket` operations run in a dedicated worker
-  thread, independently of GUI repainting and log-file I/O;
-- `START`, `STOP`, and `SINGLE` are implemented for UDP;
-- payload bytes, current counter, packets per second, and payload speed are
-  updated from real elapsed time;
-- UDP Statistics are additionally written to the text log every 20 seconds;
-- UDP destination, Pattern, and `Togeth` values are saved with `QSettings`.
+- `last value`, `value count`, and `file size` are linked calculations;
+- the most recently edited field becomes the calculation driver;
+- FILE size is always aligned to a complete 8-, 16-, or 32-bit counter field;
+- changing B, KB, MB, or GB preserves the exact underlying byte count;
+- fractional KB, MB, and GB display values are supported;
+- a dedicated `FileGeneratorWorker` and `QThread` keep disk generation outside
+  the GUI thread;
+- one reusable 4 MiB buffer is filled with little-endian counter values;
+- the `START` button changes to `STOP` during generation;
+- manual STOP closes the file only after a complete counter field;
+- file progress and min/average/max write speed update once per second;
+- START, STOP, FINISH, and file-I/O errors are written to EVENTS and the text log;
+- custom FILE names, the output folder, Pattern fields, selected calculation
+  driver, and size unit are restored through `QSettings`;
+- COM, UDP, and FILE modes are mutually locked while one mode is active.
 
 ## Build requirements
 
@@ -32,34 +36,37 @@ Version 1.7 completes the UDP transmitter tab:
 - qmake;
 - a C++11 compiler.
 
-Example build commands:
+Example build:
 
 ```text
 qmake TxDataTester.pro
 make
 ```
 
-On Windows with the appropriate Qt command prompt:
+On Windows with an MSVC Qt command prompt:
 
 ```text
 qmake TxDataTester.pro
 nmake
 ```
 
+For a MinGW kit, use the matching `mingw32-make` command.
+
 ## Thread architecture
 
-The application uses three event-loop threads.
+The application uses four event-loop threads.
 
 ### GUI thread
 
 The main thread owns:
 
 - `MainWindow` and all widgets;
-- the shared `EVENTS` view;
-- the UTF-8 text log and `flush()` operations;
+- the shared color-formatted EVENTS view;
+- the UTF-8 text log and its `flush()` calls;
 - `QSettings`;
 - COM-port enumeration through `QSerialPortInfo`;
-- the external ping and neighbor-table helper processes.
+- ping and neighbor-table helper processes;
+- validation and linked FILE Pattern calculations.
 
 ### COM TX worker thread
 
@@ -70,255 +77,231 @@ The main thread owns:
 - COM transmission timers;
 - `bytesWritten()` processing;
 - COM Statistics;
-- the soft COM `STOP` state that lets queued serial data drain.
+- soft STOP with output-queue draining.
 
 ### UDP TX worker thread
 
 `UdpTxWorker` owns:
 
 - the persistent sending `QUdpSocket`;
-- the ephemeral local UDP port reserved after a successful `CONNECT`;
 - UDP burst generation;
 - the UDP transmission timer;
 - little-endian counter-pattern generation;
 - UDP Statistics and 20-second log samples.
 
-GUI repainting, window movement, and text-log flushing therefore do not execute
-inside either transmission worker thread.
+### FILE generator worker thread
+
+`FileGeneratorWorker` owns:
+
+- `QFile`;
+- one reusable 4 MiB output buffer;
+- little-endian 8-, 16-, or 32-bit counter generation;
+- cooperative aligned write callbacks;
+- the one-second Progress timer;
+- min/average/max file-write speed calculations.
+
+GUI repainting, window movement, and text-log flushing do not execute inside the
+COM, UDP, or FILE worker thread.
 
 ## COM tab
-
-The COM implementation from v.1.5 is preserved.
 
 - available COM ports are refreshed once per second while the port is closed;
 - OPEN applies Port, Baud, Parity, and stop-bit settings;
 - START transmits counter-filled blocks continuously;
 - SINGLE transmits one block;
-- STOP stops new block generation and lets the pending serial output drain;
+- STOP stops new block generation and lets pending serial output drain;
 - Statistics show start time, elapsed time, transmitted bytes, current counter,
   and payload speed.
 
-While a COM port is open or a COM operation is pending, the UDP tab is disabled.
-The UDP tab becomes available again only after the COM port is closed.
+Opening a COM port locks the UDP and FILE tabs until CLOSE.
 
-## UDP Connection group
+## UDP tab
 
-The Connection group shows:
+### Connection
 
-```text
-our IP:  <local IPv4 address>    our MAC: <local interface MAC>
-IP:      <destination IPv4>      Port:    <destination UDP port>   CONNECT
- dest MAC: <destination MAC when available>
-```
+CONNECT validates the destination IPv4 address and UDP port, determines the local
+outgoing interface, executes one short ping, resolves the destination MAC when it
+is available in the local neighbor table, and creates the persistent UDP sending
+socket.
 
-The destination-IP editor accepts only decimal digits and dots. Full IPv4
-validation is performed before connection.
+A successful ping checks IP reachability; it does not prove that an application is
+listening on the destination UDP port.
 
-The Port editor accepts only decimal digits. The allowed range is `1...65535`.
+### Pattern
 
-### CONNECT sequence
+- `counter, bits`: 8, 16, 32, or 64;
+- `block, bytes`: UDP payload size;
+- `init value`: decimal or `0x`-prefixed hexadecimal;
+- `Togeth`: datagrams sent sequentially in one burst;
+- `Period, ms`: delay between burst callbacks;
+- START, STOP, and SINGLE are supported.
 
-`CONNECT` performs the following steps:
+The counter continues across datagrams and bursts and wraps naturally at the
+selected width. Payload byte order is little-endian.
 
-1. validates the destination IPv4 address and UDP port;
-2. asks the operating system to select the outgoing local IPv4 interface;
-3. displays the selected local IP and MAC address;
-4. starts one asynchronous IPv4 ping request;
-5. applies a short ping timeout;
-6. enables UDP transmission only when a ping reply is detected;
-7. starts an ARP/neighbor-table lookup for the destination MAC;
-8. asks `UdpTxWorker` to bind a persistent `QUdpSocket` to the selected local IP
-   and an ephemeral local port.
+### Statistics
 
-On Windows, the native ping reply timeout is 500 ms. An application-level
-watchdog terminates a ping process that runs longer than 1800 ms. Unix ping
-utilities have platform-specific timeout granularity; the same watchdog still
-limits the complete operation.
+- `tx, bytes`: payload bytes accepted by the local UDP socket;
+- `curr_count`: next counter value;
+- `packets/s`: datagrams accepted per real measured second;
+- `speed, Kb/s`: payload speed, excluding network headers.
 
-When CONNECT succeeds, destination IP and Port become read-only, the button text
-changes to `DISCONNECT`, and the COM tab is disabled. The COM tab becomes
-available again after `DISCONNECT` closes the UDP socket.
+Successful `writeDatagram()` means that the local networking stack accepted the
+datagram. It is not a delivery acknowledgement from the remote device.
 
-If ping fails, UDP START and SINGLE remain disabled and the COM tab is unlocked.
+CONNECT locks the COM and FILE tabs until DISCONNECT.
 
-The destination MAC is normally available only for a destination in the same
-layer-2 network. For a routed destination, the local neighbor table usually
-contains the next-hop router MAC instead of the final remote-device MAC, so the
-field may remain `--`.
+## FILE tab
 
-## UDP Pattern group
+### Output group
 
-The UDP Pattern controls are:
-
-- `counter, bits`: `8`, `16`, `32`, or `64`;
-- `block, bytes`: payload size of one UDP datagram;
-- `init value`: decimal or `0x`-prefixed hexadecimal initial counter;
-- `Togeth`: number of datagrams sent sequentially in one timer burst;
-- `Period, ms`: delay between burst timer events;
-- `START`, `STOP`, and `SINGLE`.
-
-Only decimal digits are accepted in `block, bytes`, `Togeth`, and `Period, ms`.
-
-`block, bytes` is rounded upward to a multiple of the selected counter size and
-is limited to the maximum IPv4 UDP payload size. For counter widths that require
-alignment, the largest usable value is the largest aligned value not exceeding
-65507 bytes.
-
-### Counter payload format
-
-Each UDP datagram contains only consecutive counter values. Values are encoded
-little-endian (`bo=LE`). The counter continues across all datagrams and all
-bursts and wraps to zero after the maximum value of the selected width.
-
-For example:
+- `Folder` can be typed, pasted, or selected with the standard
+  `QFileDialog::getExistingDirectory()` dialog opened by `...`;
+- the last folder is restored on the next launch;
+- the executable directory is used on the first launch;
+- `File` accepts a file name with extension;
+- when the File field has not been customized, an automatic name is generated,
+  for example:
 
 ```text
-counter bits = 32
-init value   = 0x10
-block bytes  = 128
-Togeth       = 4
-Period, ms   = 5
+counter_32b_init=0x1000_last=0xFFFFF_size=100MB.bin
 ```
 
-A 32-bit counter occupies four bytes, so one 128-byte datagram contains 32
-counter values. The mathematically correct ranges are:
+Clearing a custom file name restores automatic naming. Existing files require an
+explicit overwrite confirmation.
+
+### Pattern group
+
+- `counter, bits`: 8, 16, or 32;
+- `init value`: decimal or `0x`-prefixed hexadecimal;
+- `last value`: decimal or `0x`-prefixed hexadecimal;
+- `value count`: decimal or `0x`-prefixed hexadecimal;
+- `file size`: decimal number;
+- size unit: B, KB, MB, or GB.
+
+KB, MB, and GB use binary multipliers:
 
 ```text
-packet 1: 0x10 ... 0x2F
-packet 2: 0x30 ... 0x4F
-packet 3: 0x50 ... 0x6F
-packet 4: 0x70 ... 0x8F
+1 KB = 1024 B
+1 MB = 1024 × 1024 B
+1 GB = 1024 × 1024 × 1024 B
 ```
 
-After approximately 5 ms, the next burst begins with `0x90`.
+The last edited field among `last value`, `value count`, and `file size` becomes
+the driver.
 
-### START
+#### Last-value driver
 
-START resets Statistics and the counter to `init value`, sends the first burst
-immediately, then schedules later bursts according to `Period, ms`.
-
-During each burst, `Togeth` complete datagrams are generated and passed to
-`QUdpSocket::writeDatagram()` one after another without waiting for delivery to
-the receiver.
-
-`Period = 0` selects cooperative continuous mode: after one burst returns to the
-worker event loop, another zero-timeout burst is scheduled as soon as possible.
-This keeps the worker event loop responsive but intentionally adds no software
-pause between bursts.
-
-### STOP
-
-STOP immediately stops generation of new UDP datagrams. Unlike the COM soft
-STOP, UDP has no portable Qt acknowledgement that an already accepted datagram
-has physically left the network adapter, so the application reports the totals
-accepted by `writeDatagram()` at the stop moment.
-
-### SINGLE
-
-SINGLE sends exactly one UDP datagram. `Togeth` applies to continuous START
-bursts only. Every SINGLE operation starts its payload counter from the current
-`init value` field.
-
-## UDP Statistics
-
-UDP Statistics are updated approximately once per second using a monotonic
-`QElapsedTimer` and the actual elapsed interval.
-
-- `start:` — wall-clock time of START or SINGLE;
-- `time:` — elapsed duration with unlimited hours;
-- `tx, bytes` — total application payload bytes successfully accepted by
-  `writeDatagram()`;
-- `curr_count` — next counter value to be written to a new datagram;
-- `packets/s` — datagrams accepted during the latest real interval divided by
-  that interval;
-- `speed, Kb/s` — payload bits accepted during the latest real interval divided
-  by that interval.
-
-The payload-speed calculation is:
+For a 32-bit counter:
 
 ```text
-speed_Kb_s = delta_payload_bytes * 8 / delta_time_ms
+init value = 0
+last value = 1000
+value count = 1001
+file size = 1001 × 4 = 4004 B
 ```
 
-IP, UDP, Ethernet, VLAN, preamble, and inter-frame overhead are not included.
+If last value is below init value, the shortest forward range through one natural
+counter wrap is used.
 
-A successful `writeDatagram()` result means that the complete UDP datagram was
-accepted by the local socket/network stack. It is not a delivery confirmation
-from the destination and is not a portable physical-NIC transmission-complete
-notification.
-
-## Twenty-second text-log Statistics
-
-During UDP START, a detailed line is written only to the text log every 20
-seconds. It is not displayed in EVENTS.
-
-Example:
+#### Value-count driver
 
 ```text
-19:44:06.361, mode=UDP, time=00:00:20, tx_bytes=1782656, delta_tx_bytes=1782656, tx_packets=13927, delta_tx_packets=13927, curr_counter=445680, min_speed=522, avrg_speed=544.18, max_speed=621, min_packets_s=4078, avrg_packets_s=4352, max_packets_s=4788
+counter, bits = 32
+init value = 0
+value count = 1000
+last value = 999
+file size = 1000 × 4 = 4000 B
 ```
 
-The average values use the exact elapsed interval. Minimum and maximum values
-come from the approximately one-second Statistics samples inside the same
-20-second interval.
+If value count spans more than one counter cycle, last value is calculated with
+natural unsigned wraparound.
 
-## EVENTS and text logs
+#### File-size driver
 
-At every application start, a new UTF-8 file is created next to the executable:
+```text
+counter, bits = 32
+init value = 0
+entered file size = 10001 B
+aligned file size = 10000 B
+value count = 2500
+last value = 2499
+```
+
+The requested byte size is rounded downward to a multiple of the counter-field
+size. A size smaller than one counter field is normalized to one complete field.
+Changing the unit only changes the displayed representation; exact bytes are
+preserved.
+
+### File generation
+
+START opens the selected output file with truncation and fills it with consecutive
+little-endian counter values. Generation uses one reusable 4 MiB buffer and
+cooperative queued write callbacks.
+
+During generation:
+
+- the button text changes from START to STOP;
+- output and Pattern fields are locked;
+- COM and UDP tabs are locked;
+- `file:` shows `written / target B (percentage)`;
+- `speed:` shows minimum, average, and maximum MB/s;
+- Progress updates approximately once per second using actual elapsed milliseconds.
+
+Manual STOP is processed between aligned chunks. The file is flushed and closed,
+and its final length always contains a whole number of counter fields. Natural
+completion displays 100% and records FINISH in EVENTS.
+
+The average speed is total written bytes divided by total elapsed time. Minimum
+and maximum are based on real one-second intervals, including a final partial
+interval when it contains data. These values measure bytes accepted through
+`QFile` and the operating-system cache; they are not a hardware-level guarantee
+that every byte has already reached the physical storage medium.
+
+Example service events:
+
+```text
+12:30:00.100 - START file generation: counter, bits=32; init value=0; last value=999; value count=1000; file size=4000 B; file=C:\\data\\counter.bin; bo=LE
+12:30:00.180 - FINISH file generation: file=C:\\data\\counter.bin; written=4000 B; min speed=47.684 MB/s; avrg speed=47.684 MB/s; max speed=47.684 MB/s
+```
+
+Direct START and STOP button presses are green in EVENTS, service information is
+black, and errors are red.
+
+## Text logs
+
+At each application launch, TxDataTester creates:
 
 ```text
 logs/txdatatester_log__YYYY-MM-DD__HH-MM-SS-mmm.txt
 ```
 
-All EVENTS entries are duplicated in that file. Timestamps include
-milliseconds:
+Every EVENTS line is duplicated in UTF-8 text form. COM and UDP also write their
+20-second Statistics snapshots only to the text log.
 
-```text
-HH:MM:SS.mmm - event text
-```
+## Settings
 
-Colors in EVENTS:
-
-- green — direct button presses;
-- red — validation, port, socket, ping, and transmission errors;
-- black — service information and operation results.
-
-Typical UDP entries are:
-
-```text
-18:04:11.105 - CONNECT button pressed
-18:04:11.106 - Connection Settings: dest_IP=192.168.1.20; dest_PORT=5000; our_IP=192.168.1.10; our_MAC=00:11:22:33:44:55
-18:04:11.107 - PING started: dest_IP=192.168.1.20; requests=1; reply_timeout=500 ms
-18:04:11.642 - PING result: dest_IP=192.168.1.20; replies=1/1; packet_loss=0%
-18:04:11.650 - UDP socket ready: local=192.168.1.10:53124; destination=192.168.1.20:5000
-18:04:14.100 - UDP START button pressed
-18:04:14.101 - UDP START: continuous transmission started; Pattern: counter=32 bits; init=0x10 (16); block=128 bytes; Togeth=4; period=5 ms; values/packet=32; bo=LE
-```
-
-## Saved settings
-
-The application restores the following values through `QSettings`:
+The application restores:
 
 - window geometry;
-- COM Port, Baud, Parity, and stop bits;
-- COM Pattern fields;
-- UDP destination IP and Port;
-- UDP counter width, block size, initial value, Togeth, and Period.
+- COM port and COM Pattern;
+- UDP destination and UDP Pattern;
+- FILE folder, custom name state, counter width, init value, last value,
+  value count, exact size representation, selected size unit, and calculation
+  driver.
 
-COM ports and UDP destinations are not automatically opened or connected after
-restart.
+## Deployment to another Windows computer
 
-## Source files
+Build Release and run `windeployqt` from the same Qt 5.12 kit:
 
 ```text
-TxDataTester.pro
-main.cpp
-mainwindow.h
-mainwindow.cpp
-mainwindow.ui
-txworker.h
-txworker.cpp
-udptxworker.h
-udptxworker.cpp
-README.md
+windeployqt --release --compiler-runtime TxDataTester.exe
 ```
+
+Copy the entire deployment directory, including:
+
+```text
+platforms/qwindows.dll
+```
+
+Installing the full Qt SDK on the target computer is not required.

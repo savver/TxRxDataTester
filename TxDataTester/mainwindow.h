@@ -17,6 +17,7 @@
 class QCloseEvent;
 class QComboBox;
 class QProcess;
+class FileGeneratorWorker;
 class TxWorker;
 class UdpTxWorker;
 
@@ -39,8 +40,8 @@ public:
      * @brief Creates the main application window.
      * @param parent Parent widget of the window.
      * @return none
-     * @detail Initializes the GUI, validators, settings, event log, and dedicated COM
-     *         and UDP transmission worker threads.
+     * @detail Initializes the COM, UDP, and FILE interfaces, validators, settings,
+     *         event log, and dedicated transmission worker threads.
      */
     explicit MainWindow(QWidget *parent = nullptr);
 
@@ -218,6 +219,40 @@ signals:
                             quint64 initialValue,
                             const QString &patternDescription);
 
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Requests binary counter-file generation.
+     * @param filePath Absolute output file path.
+     * @param counterBits Counter width: 8, 16, or 32 bits.
+     * @param initialValue First counter value written to the file.
+     * @param lastValue Expected final counter value after valueCount fields.
+     * @param valueCount Number of complete counter fields to generate.
+     * @param targetBytes Exact aligned final file size in bytes.
+     * @param patternDescription Preformatted FILE Pattern description for EVENTS.
+     * @return none
+     * @detail Carries validated GUI settings to FileGeneratorWorker through a queued
+     *         connection.
+     */
+    void startFileGenerationRequested(const QString &filePath,
+                                      int counterBits,
+                                      quint64 initialValue,
+                                      quint64 lastValue,
+                                      quint64 valueCount,
+                                      quint64 targetBytes,
+                                      const QString &patternDescription);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Requests a user STOP of active file generation.
+     * @param none
+     * @return none
+     * @detail The worker stops between complete aligned chunks, flushes the file, and
+     *         closes it without leaving a partial counter field.
+     */
+    void stopFileGenerationRequested();
+
 protected:
 /*-----------------------------------------------------------------------------*/
 
@@ -272,6 +307,38 @@ private:
         int periodMs = 0;
         quint64 initialValue = 0;
         quint64 maximumCounterValue = 0xFFU;
+    };
+
+    /**
+     * @brief FILE Pattern field that currently drives dependent calculations.
+     * @detail LastValue selects the shortest forward counter interval, ValueCount can
+     *         span multiple counter wraps, and FileSize aligns downward to full fields.
+     */
+    enum class FilePatternDriver
+    {
+        LastValue,
+        ValueCount,
+        FileSize
+    };
+
+    /**
+     * @brief Validated FILE Pattern and output settings.
+     * @detail Contains exact byte size and complete output path passed to the dedicated
+     *         file-generation worker thread.
+     */
+    struct FilePatternSettings
+    {
+        int counterBits = 8;
+        int counterBytes = 1;
+        quint64 initialValue = 0;
+        quint64 lastValue = 0;
+        quint64 valueCount = 1;
+        quint64 fileSizeBytes = 1;
+        quint64 maximumCounterValue = 0xFFU;
+        quint64 counterModulus = 0x100U;
+        QString folderPath;
+        QString fileName;
+        QString filePath;
     };
 
 private slots:
@@ -481,6 +548,126 @@ private slots:
      *         in the UDP worker thread.
      */
     void handleUdpSingleButton();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Opens the standard output-folder selection dialog.
+     * @param none
+     * @return none
+     * @detail Starts from the current Folder field when it exists and writes the
+     *         selected directory back using native path separators.
+     */
+    void browseFileOutputFolder();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Tracks whether the FILE name was entered manually.
+     * @param text Text entered by the user in the File field.
+     * @return none
+     * @detail A non-empty manual name disables automatic suggestions; clearing the
+     *         field immediately restores the generated Pattern-based name.
+     */
+    void handleFileNameEdited(const QString &text);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Updates the suggested FILE output name.
+     * @param none
+     * @return none
+     * @detail Rebuilds the name from counter width, init value, last value, file size,
+     *         and size unit while the user has not supplied a custom name.
+     */
+    void updateSuggestedFileName();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Handles a FILE counter-width change.
+     * @param none
+     * @return none
+     * @detail Recalculates dependent Pattern fields using the currently selected driver
+     *         and updates the automatic file name.
+     */
+    void handleFileCounterBitsChanged();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Handles manual editing of the FILE initial value.
+     * @param text Current decimal or 0x-prefixed input text.
+     * @return none
+     * @detail Keeps the existing last/count/size driver and updates dependent fields as
+     *         soon as the edited value is complete and valid.
+     */
+    void handleFileInitialValueEdited(const QString &text);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Makes last value the FILE Pattern calculation driver.
+     * @param text Current decimal or 0x-prefixed input text.
+     * @return none
+     * @detail Calculates the shortest forward inclusive counter interval, including one
+     *         natural counter wrap when last value is below init value.
+     */
+    void handleFileLastValueEdited(const QString &text);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Makes value count the FILE Pattern calculation driver.
+     * @param text Current decimal or 0x-prefixed input text.
+     * @return none
+     * @detail Recalculates wrapped last value and exact aligned file size.
+     */
+    void handleFileValueCountEdited(const QString &text);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Makes file size the FILE Pattern calculation driver.
+     * @param text Current decimal size text in the selected unit.
+     * @return none
+     * @detail Converts the entered size to bytes, aligns downward to a complete counter
+     *         field, and recalculates value count and wrapped last value.
+     */
+    void handleFileSizeEdited(const QString &text);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Converts the displayed FILE size to a newly selected unit.
+     * @param none
+     * @return none
+     * @detail Preserves the exact underlying byte count while changing only the B, KB,
+     *         MB, or GB representation.
+     */
+    void handleFileSizeUnitChanged();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Normalizes all FILE Pattern fields.
+     * @param none
+     * @return none
+     * @detail Clamps invalid inputs, aligns file size, updates dependent fields, and
+     *         preserves the currently selected calculation driver.
+     */
+    void normalizeFilePattern();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Starts or stops binary counter-file generation.
+     * @param none
+     * @return none
+     * @detail START validates Pattern and output path and asks the FILE worker to create
+     *         the file; STOP requests aligned finalization and closure.
+     */
+    void handleFileStartStopButton();
 
 /*-----------------------------------------------------------------------------*/
 
@@ -713,6 +900,62 @@ private slots:
                                     double speedKbps,
                                     double packetsPerSecond);
 
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Handles readiness of the dedicated FILE worker thread.
+     * @param none
+     * @return none
+     * @detail Marks QFile, the reusable write buffer, and the FILE Statistics timer as
+     *         ready and updates controls.
+     */
+    void handleFileWorkerReady();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Receives a normal or error event from FileGeneratorWorker.
+     * @param timestamp Timestamp created in the FILE worker thread.
+     * @param text Event text without a timestamp.
+     * @param error true for a red error entry; otherwise false.
+     * @return none
+     * @detail Displays and logs the event in the GUI thread while preserving the
+     *         worker-side timestamp.
+     */
+    void handleFileWorkerEvent(const QString &timestamp,
+                               const QString &text,
+                               bool error);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Receives the current FILE generation state.
+     * @param active true while the output file is open and generation is active.
+     * @return none
+     * @detail Clears pending command state, switches START/STOP text, and synchronizes
+     *         tab and Pattern availability.
+     */
+    void handleFileGenerationStateChanged(bool active);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Receives a FILE Progress snapshot.
+     * @param writtenBytes Complete counter bytes written so far.
+     * @param targetBytes Requested final file size in bytes.
+     * @param minimumSpeedMBps Minimum sampled write speed in MB/s.
+     * @param averageSpeedMBps Average total write speed in MB/s.
+     * @param maximumSpeedMBps Maximum sampled write speed in MB/s.
+     * @return none
+     * @detail Formats the progress percentage and three speed values without accessing
+     *         worker-thread QFile state.
+     */
+    void handleFileProgressUpdated(quint64 writtenBytes,
+                                   quint64 targetBytes,
+                                   double minimumSpeedMBps,
+                                   double averageSpeedMBps,
+                                   double maximumSpeedMBps);
+
 private:
 /*-----------------------------------------------------------------------------*/
 
@@ -735,6 +978,17 @@ private:
      *         and starts the thread after setup is complete.
      */
     void initializeUdpTxThread();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Creates and starts the dedicated FILE worker thread.
+     * @param none
+     * @return none
+     * @detail Moves FileGeneratorWorker to QThread, connects queued commands and
+     *         Progress signals, and starts the thread after setup is complete.
+     */
+    void initializeFileGeneratorThread();
 
 /*-----------------------------------------------------------------------------*/
 
@@ -949,6 +1203,168 @@ private:
 /*-----------------------------------------------------------------------------*/
 
     /**
+     * @brief Recalculates dependent FILE Pattern fields.
+     * @param normalizeDriverField true to normalize and overwrite the field that drives
+     *        the calculation; false to preserve text while the user is typing.
+     * @return true when the current driver input is complete and valid.
+     * @detail Maintains exact bytes, supports natural counter wrap, and updates the
+     *         automatic file name without recursive edit signals.
+     */
+    bool recalculateFilePattern(bool normalizeDriverField);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Reads and validates FILE output and Pattern settings.
+     * @param settings Output pointer for complete validated settings.
+     * @param errorText Output fixed English validation error.
+     * @return true when folder, file name, Pattern, and exact byte size are valid.
+     * @detail Rechecks modulo last value and rejects path separators or Windows-invalid
+     *         characters in the user file name.
+     */
+    bool readFilePatternSettings(FilePatternSettings *settings,
+                                 QString *errorText) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Parses decimal or 0x-prefixed unsigned text.
+     * @param text Input text to parse.
+     * @param maximumValue Maximum accepted value.
+     * @param value Output parsed value.
+     * @return true when the complete input is valid and within range.
+     * @detail Shared by FILE init, last, and value-count processing.
+     */
+    bool parseFileUnsignedValue(const QString &text,
+                                quint64 maximumValue,
+                                quint64 *value) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Converts the FILE size field to raw bytes.
+     * @param byteCount Output unaligned byte count.
+     * @return true when the decimal number and selected unit fit the QFile range.
+     * @detail Accepts fractional KB, MB, and GB values and floors fractional bytes.
+     */
+    bool parseFileSizeBytes(quint64 *byteCount) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Returns the selected FILE counter width.
+     * @param none
+     * @return 8, 16, or 32 bits; unexpected text safely maps to 8.
+     * @detail Used by live calculations and final validation.
+     */
+    int selectedFileCounterBits() const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Returns the selected FILE counter size.
+     * @param none
+     * @return Counter field size of 1, 2, or 4 bytes.
+     * @detail Derived directly from selectedFileCounterBits().
+     */
+    quint64 fileCounterBytes() const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Returns the maximum selected FILE counter value.
+     * @param none
+     * @return 0xFF, 0xFFFF, or 0xFFFFFFFF.
+     * @detail Used to validate input and compute natural wraparound.
+     */
+    quint64 fileMaximumCounterValue() const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Returns the selected FILE counter modulus.
+     * @param none
+     * @return 256, 65536, or 4294967296.
+     * @detail Allows wrapped last-value calculations without overflowing a 32-bit field.
+     */
+    quint64 fileCounterModulus() const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Returns the selected FILE size-unit multiplier.
+     * @param none
+     * @return Binary multiplier for B, KB, MB, or GB.
+     * @detail KB, MB, and GB use powers of 1024.
+     */
+    quint64 fileSizeUnitMultiplier() const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Formats exact bytes in the selected FILE size unit.
+     * @param byteCount Exact aligned byte count.
+     * @return Decimal text suitable for the file-size line edit.
+     * @detail B remains integral; larger units use sufficient fixed precision and remove
+     *         insignificant trailing zeros.
+     */
+    QString formatFileSizeForSelectedUnit(quint64 byteCount) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Formats a derived FILE counter value.
+     * @param value Counter value to format.
+     * @param preferHex true to return 0x-prefixed uppercase hexadecimal text.
+     * @return Decimal or hexadecimal counter text.
+     * @detail Derived last values follow hexadecimal input when init or last uses 0x.
+     */
+    QString formatFileCounterValue(quint64 value, bool preferHex) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Formats FILE write speed for the Progress group.
+     * @param speedMBps Speed in MB/s.
+     * @return Numeric value with MB/s suffix and at most three fractional digits.
+     * @detail Invalid and non-positive values are displayed as 0 MB/s.
+     */
+    QString formatFileSpeed(double speedMBps) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Builds a FILE Pattern description for EVENTS.
+     * @param settings Validated FILE Pattern settings.
+     * @return Counter width, init, last, value count, and exact file-size description.
+     * @detail Preserves hexadecimal GUI representation and includes exact bytes.
+     */
+    QString filePatternDescription(const FilePatternSettings &settings) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Resets FILE Progress labels to their idle values.
+     * @param targetBytes Target size to display, or zero when no target is known.
+     * @return none
+     * @detail Restores zero progress and placeholder min/average/max speed values.
+     */
+    void resetFileProgress(quint64 targetBytes);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Builds the automatic FILE output name.
+     * @param none
+     * @return Pattern-based file name ending in .bin.
+     * @detail Uses only filename-safe counter, init, last, size, and unit components,
+     *         for example counter_32b_init=0x1000_last=0xFFFFF_size=100MB.bin.
+     */
+    QString suggestedFileName() const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
      * @brief Adds an event with the current timestamp.
      * @param eventText Event text without a timestamp.
      * @param eventType Event type that controls color and emphasis.
@@ -1020,8 +1436,8 @@ private:
      * @brief Restores settings from the previous run.
      * @param none
      * @return none
-     * @detail Loads window geometry, COM settings, and Pattern values, including
-     *         migration from the former TxRxDataTester application name.
+     * @detail Loads window geometry, COM and UDP settings, and FILE folder and
+     *         Pattern values, including migration from the former application name.
      */
     void loadSettings();
 
@@ -1031,8 +1447,8 @@ private:
      * @brief Saves the current application settings.
      * @param none
      * @return none
-     * @detail Normalizes editable fields and stores window geometry, COM settings, and
-     *         Pattern values through QSettings.
+     * @detail Normalizes editable fields and stores window geometry, COM and UDP
+     *         settings, plus FILE folder and Pattern values through QSettings.
      */
     void saveSettings();
 
@@ -1216,10 +1632,12 @@ private:
     Ui::MainWindow *ui;
     TxWorker *m_txWorker;
     UdpTxWorker *m_udpTxWorker;
+    FileGeneratorWorker *m_fileGeneratorWorker;
     QProcess *m_pingProcess;
     QProcess *m_neighborLookupProcess;
     QThread m_txThread;
     QThread m_udpTxThread;
+    QThread m_fileGeneratorThread;
     QTimer m_portRefreshTimer;
     QTimer m_pingTimeoutTimer;
     QFile m_logFile;
@@ -1238,8 +1656,11 @@ private:
     QString m_udpDestinationIp;
     quint16 m_udpDestinationPort;
     quint16 m_udpLocalPort;
+    FilePatternDriver m_filePatternDriver;
+    quint64 m_fileTargetBytes;
     bool m_workerReady;
     bool m_udpWorkerReady;
+    bool m_fileWorkerReady;
     bool m_portOpen;
     bool m_testRunning;
     bool m_singleTransferActive;
@@ -1256,6 +1677,10 @@ private:
     bool m_udpDisconnectRequestedByUser;
     bool m_pingInProgress;
     bool m_neighborLookupInProgress;
+    bool m_fileNameCustomized;
+    bool m_fileGenerationActive;
+    bool m_fileGenerationCommandPending;
+    bool m_fileUpdatingPattern;
     bool m_shutdownPrepared;
 };
 

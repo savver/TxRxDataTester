@@ -17,7 +17,7 @@
       </size>
     </property>
     <property name="windowTitle">
-      <string>RxDataTester (v.1.7)</string>
+      <string>RxDataTester (v.1.9)</string>
     </property>
     <widget class="QWidget" name="centralWidget">
       <layout class="QVBoxLayout" name="mainVerticalLayout">
@@ -1621,6 +1621,519 @@
                 </item>
               </layout>
             </widget>
+            <widget class="QWidget" name="fileTab">
+              <attribute name="title">
+                <string>FILE</string>
+              </attribute>
+              <layout class="QVBoxLayout" name="fileTabVerticalLayout">
+                <property name="leftMargin">
+                  <number>10</number>
+                </property>
+                <property name="topMargin">
+                  <number>10</number>
+                </property>
+                <property name="rightMargin">
+                  <number>10</number>
+                </property>
+                <property name="bottomMargin">
+                  <number>10</number>
+                </property>
+                <property name="spacing">
+                  <number>8</number>
+                </property>
+                <item>
+                  <widget class="QGroupBox" name="fileSelectionGroupBox">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>105</height>
+                      </size>
+                    </property>
+                    <property name="title">
+                      <string>File</string>
+                    </property>
+                    <layout class="QGridLayout" name="fileSelectionGridLayout">
+                      <property name="horizontalSpacing">
+                        <number>10</number>
+                      </property>
+                      <property name="verticalSpacing">
+                        <number>10</number>
+                      </property>
+                      <item row="0" column="0">
+                        <widget class="QLabel" name="fileFolderLabel">
+                          <property name="text">
+                            <string>Folder</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>fileFolderLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="1">
+                        <widget class="QLineEdit" name="fileFolderLineEdit">
+                          <property name="focusPolicy">
+                            <enum>Qt::ClickFocus</enum>
+                          </property>
+                          <property name="readOnly">
+                            <bool>true</bool>
+                          </property>
+                          <property name="placeholderText">
+                            <string>Selected file folder</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="0">
+                        <widget class="QLabel" name="fileNameLabel">
+                          <property name="text">
+                            <string>File</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>fileNameLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="1">
+                        <widget class="QLineEdit" name="fileNameLineEdit">
+                          <property name="focusPolicy">
+                            <enum>Qt::ClickFocus</enum>
+                          </property>
+                          <property name="readOnly">
+                            <bool>true</bool>
+                          </property>
+                          <property name="placeholderText">
+                            <string>Selected file name</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="2" rowspan="2">
+                        <widget class="QPushButton" name="fileSelectButton">
+                          <property name="minimumSize">
+                            <size>
+                              <width>115</width>
+                              <height>68</height>
+                            </size>
+                          </property>
+                          <property name="text">
+                            <string>SELECT</string>
+                          </property>
+                        </widget>
+                      </item>
+                    </layout>
+                  </widget>
+                </item>
+                <item>
+                  <widget class="QGroupBox" name="filePatternGroupBox">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>155</height>
+                      </size>
+                    </property>
+                    <property name="title">
+                      <string>Pattern</string>
+                    </property>
+                    <layout class="QGridLayout" name="filePatternGridLayout">
+                      <property name="horizontalSpacing">
+                        <number>10</number>
+                      </property>
+                      <property name="verticalSpacing">
+                        <number>10</number>
+                      </property>
+                      <item row="0" column="0">
+                        <widget class="QLabel" name="fileCounterBitsLabel">
+                          <property name="text">
+                            <string>counter, bits</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>fileCounterBitsComboBox</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="1">
+                        <widget class="QComboBox" name="fileCounterBitsComboBox">
+                          <property name="minimumSize">
+                            <size>
+                              <width>150</width>
+                              <height>0</height>
+                            </size>
+                          </property>
+                          <property name="currentIndex">
+                            <number>2</number>
+                          </property>
+                          <item>
+                            <property name="text">
+                              <string>8</string>
+                            </property>
+                          </item>
+                          <item>
+                            <property name="text">
+                              <string>16</string>
+                            </property>
+                          </item>
+                          <item>
+                            <property name="text">
+                              <string>32</string>
+                            </property>
+                          </item>
+                        </widget>
+                      </item>
+                      <item row="0" column="2">
+                        <spacer name="filePatternMiddleSpacerTop">
+                          <property name="orientation">
+                            <enum>Qt::Horizontal</enum>
+                          </property>
+                          <property name="sizeType">
+                            <enum>QSizePolicy::Fixed</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                            <size>
+                              <width>18</width>
+                              <height>20</height>
+                            </size>
+                          </property>
+                        </spacer>
+                      </item>
+                      <item row="0" column="3">
+                        <widget class="QLabel" name="fileSizeLabel">
+                          <property name="text">
+                            <string>file size</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>fileSizeLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="4">
+                        <layout class="QHBoxLayout" name="fileSizeHorizontalLayout">
+                          <property name="spacing">
+                            <number>6</number>
+                          </property>
+                          <item>
+                            <widget class="QLineEdit" name="fileSizeLineEdit">
+                              <property name="minimumSize">
+                                <size>
+                                  <width>130</width>
+                                  <height>0</height>
+                                </size>
+                              </property>
+                              <property name="focusPolicy">
+                                <enum>Qt::NoFocus</enum>
+                              </property>
+                              <property name="text">
+                                <string>0</string>
+                              </property>
+                              <property name="readOnly">
+                                <bool>true</bool>
+                              </property>
+                              <property name="alignment">
+                                <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                              </property>
+                            </widget>
+                          </item>
+                          <item>
+                            <widget class="QComboBox" name="fileSizeUnitComboBox">
+                              <property name="minimumSize">
+                                <size>
+                                  <width>70</width>
+                                  <height>0</height>
+                                </size>
+                              </property>
+                              <item>
+                                <property name="text">
+                                  <string>B</string>
+                                </property>
+                              </item>
+                              <item>
+                                <property name="text">
+                                  <string>KB</string>
+                                </property>
+                              </item>
+                              <item>
+                                <property name="text">
+                                  <string>MB</string>
+                                </property>
+                              </item>
+                              <item>
+                                <property name="text">
+                                  <string>GB</string>
+                                </property>
+                              </item>
+                            </widget>
+                          </item>
+                        </layout>
+                      </item>
+                      <item row="1" column="0">
+                        <widget class="QLabel" name="fileInitValueLabel">
+                          <property name="text">
+                            <string>init value</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>fileInitValueLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="1">
+                        <widget class="QLineEdit" name="fileInitValueLineEdit">
+                          <property name="text">
+                            <string>0</string>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="2">
+                        <spacer name="filePatternMiddleSpacerSecond">
+                          <property name="orientation">
+                            <enum>Qt::Horizontal</enum>
+                          </property>
+                          <property name="sizeType">
+                            <enum>QSizePolicy::Fixed</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                            <size>
+                              <width>18</width>
+                              <height>20</height>
+                            </size>
+                          </property>
+                        </spacer>
+                      </item>
+                      <item row="1" column="3">
+                        <widget class="QLabel" name="fileValueCountLabel">
+                          <property name="text">
+                            <string>value count</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>fileValueCountLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="4">
+                        <widget class="QLineEdit" name="fileValueCountLineEdit">
+                          <property name="focusPolicy">
+                            <enum>Qt::NoFocus</enum>
+                          </property>
+                          <property name="text">
+                            <string>0</string>
+                          </property>
+                          <property name="readOnly">
+                            <bool>true</bool>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="0">
+                        <widget class="QLabel" name="fileLastValueLabel">
+                          <property name="text">
+                            <string>last value</string>
+                          </property>
+                          <property name="buddy">
+                            <cstring>fileLastValueLineEdit</cstring>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="1">
+                        <widget class="QLineEdit" name="fileLastValueLineEdit">
+                          <property name="focusPolicy">
+                            <enum>Qt::NoFocus</enum>
+                          </property>
+                          <property name="text">
+                            <string>--</string>
+                          </property>
+                          <property name="readOnly">
+                            <bool>true</bool>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="2">
+                        <spacer name="filePatternMiddleSpacerLast">
+                          <property name="orientation">
+                            <enum>Qt::Horizontal</enum>
+                          </property>
+                          <property name="sizeType">
+                            <enum>QSizePolicy::Fixed</enum>
+                          </property>
+                          <property name="sizeHint" stdset="0">
+                            <size>
+                              <width>18</width>
+                              <height>20</height>
+                            </size>
+                          </property>
+                        </spacer>
+                      </item>
+                      <item row="0" column="5" rowspan="3">
+                        <widget class="QPushButton" name="fileCheckButton">
+                          <property name="minimumSize">
+                            <size>
+                              <width>115</width>
+                              <height>105</height>
+                            </size>
+                          </property>
+                          <property name="text">
+                            <string>CHECK</string>
+                          </property>
+                        </widget>
+                      </item>
+                    </layout>
+                  </widget>
+                </item>
+                <item>
+                  <widget class="QGroupBox" name="fileStatisticsGroupBox">
+                    <property name="minimumSize">
+                      <size>
+                        <width>0</width>
+                        <height>155</height>
+                      </size>
+                    </property>
+                    <property name="title">
+                      <string>Statistics</string>
+                    </property>
+                    <layout class="QGridLayout" name="fileStatisticsGridLayout">
+                      <property name="horizontalSpacing">
+                        <number>12</number>
+                      </property>
+                      <property name="verticalSpacing">
+                        <number>5</number>
+                      </property>
+                      <item row="0" column="0">
+                        <widget class="QLabel" name="fileOkLabel">
+                          <property name="text">
+                            <string>OK:</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="0" column="1" colspan="3">
+                        <widget class="QLabel" name="fileOkValueLabel">
+                          <property name="text">
+                            <string>0 (0%)</string>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignLeft|Qt::AlignLeading|Qt::AlignVCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="0">
+                        <widget class="QLabel" name="fileErrLabel">
+                          <property name="text">
+                            <string>ERR:</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="1" column="1" colspan="3">
+                        <widget class="QLabel" name="fileErrValueLabel">
+                          <property name="text">
+                            <string>0 (0%)</string>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignLeft|Qt::AlignLeading|Qt::AlignVCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="0">
+                        <widget class="QLabel" name="fileChunksLabel">
+                          <property name="text">
+                            <string>Chunks:</string>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="1">
+                        <widget class="QLabel" name="fileChunkMinValueLabel">
+                          <property name="text">
+                            <string>--</string>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="2">
+                        <widget class="QLabel" name="fileChunkAverageValueLabel">
+                          <property name="text">
+                            <string>--</string>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="2" column="3">
+                        <widget class="QLabel" name="fileChunkMaxValueLabel">
+                          <property name="text">
+                            <string>--</string>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignCenter</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="3" column="1">
+                        <widget class="QLabel" name="fileChunkMinCaptionLabel">
+                          <property name="font">
+                            <font>
+                              <pointsize>8</pointsize>
+                            </font>
+                          </property>
+                          <property name="text">
+                            <string>(min)</string>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignHCenter|Qt::AlignTop</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="3" column="2">
+                        <widget class="QLabel" name="fileChunkAverageCaptionLabel">
+                          <property name="font">
+                            <font>
+                              <pointsize>8</pointsize>
+                            </font>
+                          </property>
+                          <property name="text">
+                            <string>(avrg)</string>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignHCenter|Qt::AlignTop</set>
+                          </property>
+                        </widget>
+                      </item>
+                      <item row="3" column="3">
+                        <widget class="QLabel" name="fileChunkMaxCaptionLabel">
+                          <property name="font">
+                            <font>
+                              <pointsize>8</pointsize>
+                            </font>
+                          </property>
+                          <property name="text">
+                            <string>(max)</string>
+                          </property>
+                          <property name="alignment">
+                            <set>Qt::AlignHCenter|Qt::AlignTop</set>
+                          </property>
+                        </widget>
+                      </item>
+                    </layout>
+                  </widget>
+                </item>
+                <item>
+                  <spacer name="fileBottomVerticalSpacer">
+                    <property name="orientation">
+                      <enum>Qt::Vertical</enum>
+                    </property>
+                    <property name="sizeHint" stdset="0">
+                      <size>
+                        <width>20</width>
+                        <height>10</height>
+                      </size>
+                    </property>
+                  </spacer>
+                </item>
+              </layout>
+            </widget>
           </widget>
         </item>
         <item>
@@ -1688,5 +2201,10 @@
     <tabstop>udpTogetherLineEdit</tabstop>
     <tabstop>udpPeriodMsLineEdit</tabstop>
     <tabstop>udpStopButton</tabstop>
+    <tabstop>fileSelectButton</tabstop>
+    <tabstop>fileCounterBitsComboBox</tabstop>
+    <tabstop>fileInitValueLineEdit</tabstop>
+    <tabstop>fileSizeUnitComboBox</tabstop>
+    <tabstop>fileCheckButton</tabstop>
   </tabstops>
 </ui>

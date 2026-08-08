@@ -18,6 +18,7 @@
 class QCloseEvent;
 class QComboBox;
 class QProcess;
+class FileCheckWorker;
 class RxWorker;
 class UdpRxWorker;
 
@@ -29,9 +30,9 @@ class MainWindow;
 /**
  * @brief Main application window for RxDataTester.
  * @detail Runs in the main GUI thread and manages widgets, COM-port discovery, UDP
- *         connection probing, EVENTS, the text log, and QSettings. COM reception runs
- *         in RxWorker, while UDP reception runs in UdpRxWorker in a second dedicated
- *         worker thread.
+ *         connection probing, FILE selection, EVENTS, the text log, and QSettings. COM
+ *         reception runs in RxWorker, UDP reception runs in UdpRxWorker, and binary-file
+ *         verification runs in FileCheckWorker in dedicated worker threads.
  */
 class MainWindow final : public QMainWindow
 {
@@ -43,7 +44,7 @@ public:
      * @param parent Parent widget of the window.
      * @return none
      * @detail Configures the GUI, validators, event log, settings persistence, and the
-     *         dedicated COM and UDP receiver worker threads.
+     *         dedicated COM, UDP, and FILE worker threads.
      */
     explicit MainWindow(QWidget *parent = nullptr);
 
@@ -53,7 +54,7 @@ public:
      * @brief Destroys the main application window.
      * @param none
      * @return none
-     * @detail Ensures orderly shutdown of both receiver threads, closes the log file,
+     * @detail Ensures orderly shutdown of all worker threads, closes the log file,
      *         and releases the Qt Designer user interface.
      */
     ~MainWindow() override;
@@ -181,6 +182,36 @@ signals:
      */
     void stopUdpReceptionRequested();
 
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Requests verification of a selected binary counter file.
+     * @param filePath Absolute path of the file to check.
+     * @param counterBits Counter width: 8, 16, or 32 bits.
+     * @param initialValue First expected counter value.
+     * @param hexadecimalDisplay true to format counter values as hexadecimal in EVENTS.
+     * @param patternDescription Preformatted FILE Pattern description for the log.
+     * @return none
+     * @detail Transfers only validated scalar data to FileCheckWorker through a queued
+     *         connection; QFile is never accessed from the GUI thread during checking.
+     */
+    void startFileCheckRequested(const QString &filePath,
+                                 int counterBits,
+                                 quint64 initialValue,
+                                 bool hexadecimalDisplay,
+                                 const QString &patternDescription);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Requests stop of an active binary-file check.
+     * @param none
+     * @return none
+     * @detail FileCheckWorker closes the file and emits final partial Statistics in its
+     *         owning thread.
+     */
+    void stopFileCheckRequested();
+
 protected:
 /*-----------------------------------------------------------------------------*/
 
@@ -188,7 +219,7 @@ protected:
      * @brief Handles closing of the main window.
      * @param event Qt close event for the window.
      * @return none
-     * @detail Synchronously stops both receiver threads, saves the settings, closes the
+     * @detail Synchronously stops all worker threads, saves the settings, closes the
      *         log, and then passes the event to the base QMainWindow implementation.
      */
     void closeEvent(QCloseEvent *event) override;
@@ -236,6 +267,24 @@ private:
         int periodMs = 0;
         quint64 initialValue = 0;
         quint64 maximumCounterValue = 0xFFU;
+    };
+
+    /**
+     * @brief Validated FILE Pattern settings derived from the selected file.
+     * @detail completeValueCount excludes trailing bytes that cannot form one complete
+     *         counter. lastValue is the expected value of the final complete counter.
+     */
+    struct FilePatternSettings
+    {
+        int counterBits = 8;
+        int counterBytes = 1;
+        quint64 initialValue = 0;
+        quint64 maximumCounterValue = 0xFFU;
+        quint64 completeValueCount = 0;
+        quint64 lastValue = 0;
+        qint64 fileSizeBytes = 0;
+        qint64 trailingBytes = 0;
+        bool hexadecimalDisplay = false;
     };
 
 private slots:
@@ -625,6 +674,108 @@ private slots:
                                     double speedKbps,
                                     double packetsPerSecond);
 
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Opens the standard file-selection dialog.
+     * @param none
+     * @return none
+     * @detail Stores the selected absolute path, displays its folder, name, and size,
+     *         updates derived Pattern fields, and records the selection in EVENTS.
+     */
+    void selectFileForCheck();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Validates and normalizes the FILE init value.
+     * @param none
+     * @return none
+     * @detail Accepts decimal or 0x-prefixed hexadecimal input, enforces the selected
+     *         width, and recalculates the expected last value.
+     */
+    void normalizeFileInitialValue();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Handles a change of FILE counter width.
+     * @param none
+     * @return none
+     * @detail Revalidates the init value, recalculates value count and last value, and
+     *         emits an alignment warning when the file has trailing bytes.
+     */
+    void handleFileCounterBitsChanged();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Updates the displayed FILE size after a unit change.
+     * @param none
+     * @return none
+     * @detail Keeps the exact byte count internally and changes only its B, KB, MB, or
+     *         GB representation in the read-only field.
+     */
+    void handleFileSizeUnitChanged();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Starts or stops binary-file verification.
+     * @param none
+     * @return none
+     * @detail CHECK validates the selected file and Pattern before sending a queued
+     *         command. While checking, the same button becomes STOP.
+     */
+    void handleFileCheckButton();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Handles readiness of the FILE worker thread.
+     * @param none
+     * @return none
+     * @detail Enables FILE controls after QFile, worker timers, and the persistent read
+     *         buffer are created in FileCheckWorker.
+     */
+    void handleFileWorkerReady();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Receives the active FILE verification state.
+     * @param running true while FileCheckWorker is checking a file.
+     * @return none
+     * @detail Clears the pending command flag, switches CHECK and STOP text, and locks
+     *         the COM and UDP tabs while the FILE operation is active.
+     */
+    void handleFileCheckingStateChanged(bool running);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Receives a prepared FILE Statistics snapshot.
+     * @param processedValues Number of complete values already checked.
+     * @param totalValues Total complete values in the file.
+     * @param counterOk Number of matching counter values.
+     * @param counterErrors Number of mismatching counter values.
+     * @param minimumSkipped Minimum counter-jump size recorded for one mismatch.
+     * @param averageSkipped Average counter-jump size over mismatch events.
+     * @param maximumSkipped Maximum counter-jump size recorded for one mismatch.
+     * @param chunkSampleAvailable true after at least one mismatch was recorded.
+     * @return none
+     * @detail Formats OK and ERR percentages and the Chunks min/avrg/max values without
+     *         doing file I/O in the GUI thread.
+     */
+    void handleFileStatisticsUpdated(quint64 processedValues,
+                                     quint64 totalValues,
+                                     quint64 counterOk,
+                                     quint64 counterErrors,
+                                     quint64 minimumSkipped,
+                                     double averageSkipped,
+                                     quint64 maximumSkipped,
+                                     bool chunkSampleAvailable);
+
 private:
 /*-----------------------------------------------------------------------------*/
 
@@ -651,10 +802,21 @@ private:
 /*-----------------------------------------------------------------------------*/
 
     /**
+     * @brief Creates and starts the dedicated FILE verification worker thread.
+     * @param none
+     * @return none
+     * @detail Moves FileCheckWorker to QThread, connects queued commands and worker
+     *         replies, and starts the thread after all connections are configured.
+     */
+    void initializeFileCheckThread();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
      * @brief Updates enabled states of the controls.
      * @param none
      * @return none
-     * @detail Accounts for both worker threads, COM and UDP connection states, active
+     * @detail Accounts for COM, UDP, and FILE worker states, active
      *         reception, tab locking, and pending asynchronous commands.
      */
     void updateControlStates();
@@ -753,7 +915,7 @@ private:
      * @brief Performs one-time application shutdown.
      * @param none
      * @return none
-     * @detail Invokes both worker shutdown slots through blocking queued calls, waits
+     * @detail Invokes all worker shutdown slots through blocking queued calls, waits
      *         for both QThreads, processes final events, saves settings, and closes the
      *         log.
      */
@@ -998,6 +1160,125 @@ private:
 /*-----------------------------------------------------------------------------*/
 
     /**
+     * @brief Recalculates all read-only FILE Pattern fields.
+     * @param logAlignmentWarning true to add a new warning for fractional value count.
+     * @return none
+     * @detail Uses the exact selected-file size, selected counter width, and init value
+     *         to display file size, value count, trailing bytes, and expected last value.
+     */
+    void updateFileDerivedFields(bool logAlignmentWarning);
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Resets FILE Statistics widgets to their idle state.
+     * @param none
+     * @return none
+     * @detail Displays zero OK and ERR values and clears Chunks min/avrg/max fields.
+     */
+    void resetFileStatistics();
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Reads and validates FILE Pattern settings.
+     * @param settings Output pointer for derived and validated FILE settings.
+     * @param errorText Output pointer for a validation error message.
+     * @return true when the selected file and Pattern are valid; otherwise false.
+     * @detail Rechecks the current file size, init range, complete-value count, expected
+     *         last value, and trailing-byte count immediately before CHECK.
+     */
+    bool readFilePatternSettings(FilePatternSettings *settings,
+                                 QString *errorText) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Parses the FILE initial counter value.
+     * @param value Output pointer for the parsed unsigned value.
+     * @return true when decimal or 0x-prefixed input fits the selected FILE counter.
+     * @detail The method preserves the user's display base and does not modify widgets.
+     */
+    bool parseFileInitialValue(quint64 *value) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Returns the selected FILE counter size in bytes.
+     * @param none
+     * @return A size of 1, 2, or 4 bytes.
+     * @detail Unexpected GUI text is safely interpreted as one byte.
+     */
+    quint64 fileCounterBytes() const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Returns the maximum value of the selected FILE counter.
+     * @param none
+     * @return Maximum unsigned value for the current 8-, 16-, or 32-bit width.
+     * @detail Used for validation and natural wrap-around of the expected last value.
+     */
+    quint64 fileMaximumCounterValue() const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Formats the selected file size in the current unit.
+     * @param fileSizeBytes Exact file size in bytes.
+     * @return Compact B, KB, MB, or GB numeric text without a unit suffix.
+     * @detail Binary multipliers are used: 1 KB=1024 B, 1 MB=1024^2 B, and 1 GB=1024^3 B.
+     */
+    QString formatFileSize(qint64 fileSizeBytes) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Formats exact or fractional FILE value count.
+     * @param completeValues Number of complete counters in the file.
+     * @param trailingBytes Remaining bytes after the last complete counter.
+     * @param counterBytes Selected counter size in bytes.
+     * @return Exact decimal count, including .25, .5, or .75 when required.
+     * @detail Avoids floating-point rounding for very large files.
+     */
+    QString formatFileValueCount(quint64 completeValues,
+                                 qint64 trailingBytes,
+                                 quint64 counterBytes) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Formats a FILE counter value in the init-value display base.
+     * @param value Unsigned counter value to format.
+     * @return Decimal or uppercase 0x-prefixed hexadecimal text.
+     * @detail Hexadecimal is selected when the current init field begins with 0x.
+     */
+    QString formatFileCounterValue(quint64 value) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Formats a percentage for FILE Statistics.
+     * @param part Numerator value.
+     * @param total Denominator value.
+     * @return Percentage text with insignificant trailing zeros removed.
+     * @detail Returns 0 when no complete values have been processed.
+     */
+    QString formatFilePercentage(quint64 part, quint64 total) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
+     * @brief Builds the FILE Pattern description for the event log.
+     * @param settings Validated FILE Pattern settings.
+     * @return A file/counter/init/last/count/size/trailing/bo=LE description string.
+     * @detail Hexadecimal init input keeps FILE counter values in hexadecimal form.
+     */
+    QString filePatternDescription(const FilePatternSettings &settings) const;
+
+/*-----------------------------------------------------------------------------*/
+
+    /**
      * @brief Reads and validates Pattern settings.
      * @param settings Output pointer for the validated settings.
      * @param errorText Output pointer for a validation error message.
@@ -1122,12 +1403,14 @@ private:
     void selectComboBoxText(QComboBox *comboBox, const QString &value) const;
 
     Ui::MainWindow *ui;
+    FileCheckWorker *m_fileCheckWorker;
     RxWorker *m_rxWorker;
     UdpRxWorker *m_udpRxWorker;
     QProcess *m_pingProcess;
     QProcess *m_neighborLookupProcess;
     QThread m_rxThread;
     QThread m_udpRxThread;
+    QThread m_fileCheckThread;
     QTimer m_portRefreshTimer;
     QTimer m_pingTimeoutTimer;
     QFile m_logFile;
@@ -1143,9 +1426,14 @@ private:
     QString m_udpOurMac;
     QString m_udpDestinationMac;
     QString m_udpDestinationIp;
+    QString m_selectedFilePath;
+    QString m_fileLastFolder;
+    QString m_lastFileAlignmentWarningKey;
+    qint64 m_selectedFileSizeBytes;
     quint16 m_udpDestinationPort;
     bool m_workerReady;
     bool m_udpWorkerReady;
+    bool m_fileWorkerReady;
     bool m_portOpen;
     bool m_testRunning;
     bool m_portOperationPending;
@@ -1159,6 +1447,8 @@ private:
     bool m_udpDisconnectRequestedByUser;
     bool m_pingInProgress;
     bool m_neighborLookupInProgress;
+    bool m_fileCheckRunning;
+    bool m_fileCheckCommandPending;
     bool m_shutdownPrepared;
 };
 

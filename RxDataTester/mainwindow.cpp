@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "filecheckworker.h"
 #include "rxworker.h"
 #include "udprxworker.h"
 #include "ui_mainwindow.h"
@@ -10,6 +11,8 @@
 #include <QDateTime>
 #include <QDir>
 #include <QEvent>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QFileDevice>
 #include <QFont>
 #include <QFontDatabase>
@@ -127,20 +130,23 @@ QString processErrorText(QProcess::ProcessError error)
  * @param parent Parent widget of the window.
  * @return none
  * @detail Configures the GUI, validators, event log, settings persistence, and the
- *         dedicated COM and UDP receiver worker threads.
+ *         dedicated COM, UDP, and FILE worker threads.
  */
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
+    , m_fileCheckWorker(nullptr)
     , m_rxWorker(nullptr)
     , m_udpRxWorker(nullptr)
     , m_pingProcess(nullptr)
     , m_neighborLookupProcess(nullptr)
     , m_portRefreshTimer(this)
     , m_pingTimeoutTimer(this)
+    , m_selectedFileSizeBytes(0)
     , m_udpDestinationPort(0)
     , m_workerReady(false)
     , m_udpWorkerReady(false)
+    , m_fileWorkerReady(false)
     , m_portOpen(false)
     , m_testRunning(false)
     , m_portOperationPending(false)
@@ -154,6 +160,8 @@ MainWindow::MainWindow(QWidget *parent)
     , m_udpDisconnectRequestedByUser(false)
     , m_pingInProgress(false)
     , m_neighborLookupInProgress(false)
+    , m_fileCheckRunning(false)
+    , m_fileCheckCommandPending(false)
     , m_shutdownPrepared(false)
 {
     ui->setupUi(this);
@@ -170,6 +178,12 @@ MainWindow::MainWindow(QWidget *parent)
     ui->udpPatternGridLayout->setColumnStretch(4, 1);
     ui->udpStatisticsGridLayout->setColumnStretch(1, 1);
     ui->udpStatisticsGridLayout->setColumnStretch(4, 1);
+    ui->fileSelectionGridLayout->setColumnStretch(1, 1);
+    ui->filePatternGridLayout->setColumnStretch(1, 1);
+    ui->filePatternGridLayout->setColumnStretch(4, 1);
+    ui->fileStatisticsGridLayout->setColumnStretch(1, 1);
+    ui->fileStatisticsGridLayout->setColumnStretch(2, 1);
+    ui->fileStatisticsGridLayout->setColumnStretch(3, 1);
 
     const QRegularExpression decimalExpression(QStringLiteral("[0-9]{0,10}"));
     ui->blockBytesLineEdit->setValidator(
@@ -188,6 +202,8 @@ MainWindow::MainWindow(QWidget *parent)
     ui->initValueLineEdit->setValidator(
         new QRegularExpressionValidator(initialValueExpression, this));
     ui->udpInitValueLineEdit->setValidator(
+        new QRegularExpressionValidator(initialValueExpression, this));
+    ui->fileInitValueLineEdit->setValidator(
         new QRegularExpressionValidator(initialValueExpression, this));
 
     const QRegularExpression ipv4CharacterExpression(
@@ -333,6 +349,26 @@ MainWindow::MainWindow(QWidget *parent)
                 }
                 updateControlStates();
             });
+    connect(ui->fileSelectButton,
+            &QPushButton::clicked,
+            this,
+            &MainWindow::selectFileForCheck);
+    connect(ui->fileInitValueLineEdit,
+            &QLineEdit::editingFinished,
+            this,
+            &MainWindow::normalizeFileInitialValue);
+    connect(ui->fileCounterBitsComboBox,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this,
+            &MainWindow::handleFileCounterBitsChanged);
+    connect(ui->fileSizeUnitComboBox,
+            QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this,
+            &MainWindow::handleFileSizeUnitChanged);
+    connect(ui->fileCheckButton,
+            &QPushButton::clicked,
+            this,
+            &MainWindow::handleFileCheckButton);
 
     m_pingTimeoutTimer.setSingleShot(true);
     m_pingTimeoutTimer.setTimerType(Qt::PreciseTimer);
@@ -364,7 +400,7 @@ MainWindow::MainWindow(QWidget *parent)
             &MainWindow::handleNeighborLookupProcessError);
 
     initializeLogFile();
-    appendEvent(tr("RxDataTester (v.1.7) started"), EventType::Normal);
+    appendEvent(tr("RxDataTester (v.1.9) started"), EventType::Normal);
 
     if (m_logFile.isOpen())
     {
@@ -383,6 +419,9 @@ MainWindow::MainWindow(QWidget *parent)
     normalizeUdpTogether();
     normalizeUdpPeriod();
     clearUdpNetworkInformation();
+    normalizeFileInitialValue();
+    updateFileDerivedFields(false);
+    resetFileStatistics();
 
     ui->startTimeValueLabel->setText(QStringLiteral("--:--:--"));
     ui->elapsedTimeValueLabel->setText(QStringLiteral("00:00:00"));
@@ -409,6 +448,7 @@ MainWindow::MainWindow(QWidget *parent)
 
     initializeRxThread();
     initializeUdpRxThread();
+    initializeFileCheckThread();
     refreshSerialPorts();
     updateControlStates();
     m_portRefreshTimer.start();
@@ -420,7 +460,7 @@ MainWindow::MainWindow(QWidget *parent)
  * @brief Destroys the main application window.
  * @param none
  * @return none
- * @detail Ensures orderly shutdown of both receiver threads, closes the log file, and
+ * @detail Ensures orderly shutdown of all worker threads, closes the log file, and
  *         releases the Qt Designer user interface.
  */
 MainWindow::~MainWindow()
@@ -439,7 +479,7 @@ MainWindow::~MainWindow()
  * @brief Handles closing of the main window.
  * @param event Qt close event for the window.
  * @return none
- * @detail Synchronously stops both receiver threads, saves the settings, closes the
+ * @detail Synchronously stops all worker threads, saves the settings, closes the
  *         log, and then passes the event to the base QMainWindow implementation.
  */
 void MainWindow::closeEvent(QCloseEvent *event)
@@ -1476,8 +1516,8 @@ void MainWindow::handleWorkerReady()
  * @param text Event text without a timestamp.
  * @param error true for a red error entry; otherwise false.
  * @return none
- * @detail Displays COM or UDP worker events in EVENTS and duplicates them to the text
- *         log in the GUI thread.
+ * @detail Displays COM, UDP, or FILE worker events in EVENTS and duplicates them to
+ *         the text log in the GUI thread.
  */
 void MainWindow::handleWorkerEvent(const QString &timestamp,
                                    const QString &text,
@@ -1730,6 +1770,284 @@ void MainWindow::handleUdpStatisticsUpdated(
 /*-----------------------------------------------------------------------------*/
 
 /**
+ * @brief Opens the standard file-selection dialog.
+ * @param none
+ * @return none
+ * @detail Stores the selected absolute path, displays its folder, name, and size,
+ *         updates derived Pattern fields, and records the selection in EVENTS.
+ */
+void MainWindow::selectFileForCheck()
+{
+    appendEvent(tr("FILE SELECT button pressed"), EventType::Action);
+
+    QString initialFolder = m_fileLastFolder.trimmed();
+    if (initialFolder.isEmpty() || !QDir(initialFolder).exists())
+    {
+        initialFolder = QCoreApplication::applicationDirPath();
+    }
+
+    const QString selectedPath = QFileDialog::getOpenFileName(
+        this,
+        tr("Select counter data file"),
+        initialFolder,
+        tr("All files (*.*)"));
+    if (selectedPath.isEmpty())
+    {
+        appendEvent(tr("FILE selection canceled"), EventType::Normal);
+        updateControlStates();
+        return;
+    }
+
+    const QFileInfo fileInfo(selectedPath);
+    if (!fileInfo.exists() || !fileInfo.isFile())
+    {
+        appendEvent(tr("FILE selection error: the selected path is not a file"),
+                    EventType::Error);
+        updateControlStates();
+        return;
+    }
+
+    m_selectedFilePath = fileInfo.absoluteFilePath();
+    m_fileLastFolder = fileInfo.absoluteDir().absolutePath();
+    m_selectedFileSizeBytes = fileInfo.size();
+    m_lastFileAlignmentWarningKey.clear();
+
+    ui->fileFolderLineEdit->setText(
+        QDir::toNativeSeparators(m_fileLastFolder));
+    ui->fileNameLineEdit->setText(fileInfo.fileName());
+    resetFileStatistics();
+
+    appendEvent(
+        tr("FILE selected: file=%1; folder=%2; size=%3 B; path=%4")
+            .arg(fileInfo.fileName(),
+                 QDir::toNativeSeparators(m_fileLastFolder),
+                 QString::number(m_selectedFileSizeBytes),
+                 QDir::toNativeSeparators(m_selectedFilePath)),
+        EventType::Normal);
+
+    updateFileDerivedFields(true);
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Validates and normalizes the FILE init value.
+ * @param none
+ * @return none
+ * @detail Accepts decimal or 0x-prefixed hexadecimal input, enforces the selected width,
+ *         and recalculates the expected last value.
+ */
+void MainWindow::normalizeFileInitialValue()
+{
+    const QString originalText = ui->fileInitValueLineEdit->text().trimmed();
+    const bool hexadecimal =
+        originalText.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive);
+
+    quint64 value = 0;
+    if (!parseFileInitialValue(&value))
+    {
+        ui->fileInitValueLineEdit->setText(QStringLiteral("0"));
+    }
+    else if (hexadecimal)
+    {
+        ui->fileInitValueLineEdit->setText(
+            QStringLiteral("0x") + QString::number(value, 16).toUpper());
+    }
+    else
+    {
+        ui->fileInitValueLineEdit->setText(QString::number(value));
+    }
+
+    updateFileDerivedFields(false);
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Handles a change of FILE counter width.
+ * @param none
+ * @return none
+ * @detail Revalidates the init value, recalculates value count and last value, and emits
+ *         an alignment warning when the file has trailing bytes.
+ */
+void MainWindow::handleFileCounterBitsChanged()
+{
+    normalizeFileInitialValue();
+    m_lastFileAlignmentWarningKey.clear();
+    updateFileDerivedFields(true);
+    resetFileStatistics();
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Updates the displayed FILE size after a unit change.
+ * @param none
+ * @return none
+ * @detail Keeps the exact byte count internally and changes only its B, KB, MB, or GB
+ *         representation in the read-only field.
+ */
+void MainWindow::handleFileSizeUnitChanged()
+{
+    updateFileDerivedFields(false);
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Starts or stops binary-file verification.
+ * @param none
+ * @return none
+ * @detail CHECK validates the selected file and Pattern before sending a queued command.
+ *         While checking, the same button becomes STOP.
+ */
+void MainWindow::handleFileCheckButton()
+{
+    if (m_fileCheckRunning)
+    {
+        if (m_fileCheckCommandPending)
+        {
+            return;
+        }
+
+        appendEvent(tr("FILE STOP button pressed"), EventType::Action);
+        m_fileCheckCommandPending = true;
+        updateControlStates();
+        emit stopFileCheckRequested();
+        return;
+    }
+
+    appendEvent(tr("FILE CHECK button pressed"), EventType::Action);
+
+    if (!m_fileWorkerReady)
+    {
+        appendEvent(tr("FILE CHECK failed: the FILE worker thread is not ready"),
+                    EventType::Error);
+        updateControlStates();
+        return;
+    }
+
+    const QFileInfo currentFileInfo(m_selectedFilePath);
+    if (!currentFileInfo.exists() || !currentFileInfo.isFile())
+    {
+        appendEvent(tr("FILE CHECK failed: select an existing file first"),
+                    EventType::Error);
+        updateControlStates();
+        return;
+    }
+
+    m_selectedFilePath = currentFileInfo.absoluteFilePath();
+    m_selectedFileSizeBytes = currentFileInfo.size();
+    updateFileDerivedFields(true);
+
+    FilePatternSettings settings;
+    QString errorText;
+    if (!readFilePatternSettings(&settings, &errorText))
+    {
+        appendEvent(tr("FILE CHECK failed: %1").arg(errorText),
+                    EventType::Error);
+        updateControlStates();
+        return;
+    }
+
+    resetFileStatistics();
+    m_fileCheckCommandPending = true;
+    updateControlStates();
+
+    emit startFileCheckRequested(m_selectedFilePath,
+                                 settings.counterBits,
+                                 settings.initialValue,
+                                 settings.hexadecimalDisplay,
+                                 filePatternDescription(settings));
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Handles readiness of the FILE worker thread.
+ * @param none
+ * @return none
+ * @detail Enables FILE controls after QFile, worker timers, and the persistent read
+ *         buffer are created in FileCheckWorker.
+ */
+void MainWindow::handleFileWorkerReady()
+{
+    m_fileWorkerReady = true;
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Receives the active FILE verification state.
+ * @param running true while FileCheckWorker is checking a file.
+ * @return none
+ * @detail Clears the pending command flag, switches CHECK and STOP text, and locks the
+ *         COM and UDP tabs while the FILE operation is active.
+ */
+void MainWindow::handleFileCheckingStateChanged(bool running)
+{
+    m_fileCheckRunning = running;
+    m_fileCheckCommandPending = false;
+    updateControlStates();
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Receives a prepared FILE Statistics snapshot.
+ * @param processedValues Number of complete values already checked.
+ * @param totalValues Total complete values in the file.
+ * @param counterOk Number of matching counter values.
+ * @param counterErrors Number of mismatching counter values.
+ * @param minimumSkipped Minimum counter-jump size recorded for one mismatch.
+ * @param averageSkipped Average counter-jump size over mismatch events.
+ * @param maximumSkipped Maximum counter-jump size recorded for one mismatch.
+ * @param chunkSampleAvailable true after at least one mismatch was recorded.
+ * @return none
+ * @detail Formats OK and ERR percentages and the Chunks min/avrg/max values without doing
+ *         file I/O in the GUI thread.
+ */
+void MainWindow::handleFileStatisticsUpdated(quint64 processedValues,
+                                             quint64 totalValues,
+                                             quint64 counterOk,
+                                             quint64 counterErrors,
+                                             quint64 minimumSkipped,
+                                             double averageSkipped,
+                                             quint64 maximumSkipped,
+                                             bool chunkSampleAvailable)
+{
+    Q_UNUSED(totalValues);
+
+    ui->fileOkValueLabel->setText(
+        tr("%1 (%2%)")
+            .arg(QString::number(counterOk),
+                 formatFilePercentage(counterOk, processedValues)));
+    ui->fileErrValueLabel->setText(
+        tr("%1 (%2%)")
+            .arg(QString::number(counterErrors),
+                 formatFilePercentage(counterErrors, processedValues)));
+
+    if (!chunkSampleAvailable)
+    {
+        ui->fileChunkMinValueLabel->setText(QStringLiteral("--"));
+        ui->fileChunkAverageValueLabel->setText(QStringLiteral("--"));
+        ui->fileChunkMaxValueLabel->setText(QStringLiteral("--"));
+        return;
+    }
+
+    ui->fileChunkMinValueLabel->setText(QString::number(minimumSkipped));
+    ui->fileChunkAverageValueLabel->setText(formatSpeed(averageSkipped));
+    ui->fileChunkMaxValueLabel->setText(QString::number(maximumSkipped));
+}
+
+
+/*-----------------------------------------------------------------------------*/
+
+/**
  * @brief Creates and starts the dedicated RX worker thread.
  * @param none
  * @return none
@@ -1894,10 +2212,71 @@ void MainWindow::initializeUdpRxThread()
 /*-----------------------------------------------------------------------------*/
 
 /**
+ * @brief Creates and starts the dedicated FILE verification worker thread.
+ * @param none
+ * @return none
+ * @detail Moves FileCheckWorker to QThread, connects queued commands and worker replies,
+ *         and starts the thread after all connections are configured.
+ */
+void MainWindow::initializeFileCheckThread()
+{
+    m_fileCheckWorker = new FileCheckWorker;
+    m_fileCheckWorker->moveToThread(&m_fileCheckThread);
+    m_fileCheckThread.setObjectName(
+        QStringLiteral("RxDataTester_FILE_Check_Worker"));
+
+    connect(&m_fileCheckThread,
+            &QThread::started,
+            m_fileCheckWorker,
+            &FileCheckWorker::initialize);
+    connect(&m_fileCheckThread,
+            &QThread::finished,
+            m_fileCheckWorker,
+            &QObject::deleteLater);
+
+    connect(this,
+            &MainWindow::startFileCheckRequested,
+            m_fileCheckWorker,
+            &FileCheckWorker::startCheck,
+            Qt::QueuedConnection);
+    connect(this,
+            &MainWindow::stopFileCheckRequested,
+            m_fileCheckWorker,
+            &FileCheckWorker::stopCheck,
+            Qt::QueuedConnection);
+
+    connect(m_fileCheckWorker,
+            &FileCheckWorker::workerReady,
+            this,
+            &MainWindow::handleFileWorkerReady,
+            Qt::QueuedConnection);
+    connect(m_fileCheckWorker,
+            &FileCheckWorker::eventGenerated,
+            this,
+            &MainWindow::handleWorkerEvent,
+            Qt::QueuedConnection);
+    connect(m_fileCheckWorker,
+            &FileCheckWorker::checkingStateChanged,
+            this,
+            &MainWindow::handleFileCheckingStateChanged,
+            Qt::QueuedConnection);
+    connect(m_fileCheckWorker,
+            &FileCheckWorker::statisticsUpdated,
+            this,
+            &MainWindow::handleFileStatisticsUpdated,
+            Qt::QueuedConnection);
+
+    m_fileCheckThread.start();
+}
+
+
+/*-----------------------------------------------------------------------------*/
+
+/**
  * @brief Updates enabled states of all controls.
  * @param none
  * @return none
- * @detail Considers both worker threads, COM and UDP connection states, active
+ * @detail Considers COM, UDP, and FILE worker states, active
  *         reception, tab locking, and pending asynchronous commands.
  */
 void MainWindow::updateControlStates()
@@ -1912,6 +2291,9 @@ void MainWindow::updateControlStates()
     const bool udpCommandBusy = m_udpReceptionCommandPending;
     const bool udpWorkerAvailable = m_udpWorkerReady && !m_shutdownPrepared;
 
+    const bool fileWorkerAvailable = m_fileWorkerReady && !m_shutdownPrepared;
+    const bool fileModeBusy = m_fileCheckRunning || m_fileCheckCommandPending;
+
     const bool udpModeLocksCom = m_pingInProgress
                                  || m_udpConnectionOperationPending
                                  || m_udpConnected
@@ -1922,21 +2304,33 @@ void MainWindow::updateControlStates()
                                  || m_testRunning
                                  || m_receptionCommandPending
                                  || m_portLossRequestPending;
+    const bool otherModeLocksFile = comModeLocksUdp || udpModeLocksCom;
 
     const int comTabIndex = ui->tabWidget->indexOf(ui->comTab);
     const int udpTabIndex = ui->tabWidget->indexOf(ui->udpTab);
+    const int fileTabIndex = ui->tabWidget->indexOf(ui->fileTab);
     if (comTabIndex >= 0)
     {
-        ui->tabWidget->setTabEnabled(comTabIndex,
-                                     !m_shutdownPrepared && !udpModeLocksCom);
+        ui->tabWidget->setTabEnabled(
+            comTabIndex,
+            !m_shutdownPrepared && !udpModeLocksCom && !fileModeBusy);
     }
     if (udpTabIndex >= 0)
     {
-        ui->tabWidget->setTabEnabled(udpTabIndex,
-                                     !m_shutdownPrepared && !comModeLocksUdp);
+        ui->tabWidget->setTabEnabled(
+            udpTabIndex,
+            !m_shutdownPrepared && !comModeLocksUdp && !fileModeBusy);
+    }
+    if (fileTabIndex >= 0)
+    {
+        ui->tabWidget->setTabEnabled(
+            fileTabIndex,
+            !m_shutdownPrepared && !otherModeLocksFile);
     }
 
-    const bool comModeAvailable = comWorkerAvailable && !udpModeLocksCom;
+    const bool comModeAvailable = comWorkerAvailable
+                                  && !udpModeLocksCom
+                                  && !fileModeBusy;
     ui->openButton->setEnabled(comModeAvailable
                                && !m_portOpen
                                && !comAsynchronousBusy
@@ -1944,7 +2338,8 @@ void MainWindow::updateControlStates()
     ui->closeButton->setEnabled(comWorkerAvailable
                                 && m_portOpen
                                 && !m_portOperationPending
-                                && !m_portLossRequestPending);
+                                && !m_portLossRequestPending
+                                && !fileModeBusy);
 
     const bool portSettingsEnabled = comModeAvailable
                                      && !m_portOpen
@@ -1969,9 +2364,12 @@ void MainWindow::updateControlStates()
     ui->stopButton->setEnabled(comWorkerAvailable
                                && m_portOpen
                                && m_testRunning
-                               && !comAsynchronousBusy);
+                               && !comAsynchronousBusy
+                               && !fileModeBusy);
 
-    const bool udpModeAvailable = udpWorkerAvailable && !comModeLocksUdp;
+    const bool udpModeAvailable = udpWorkerAvailable
+                                  && !comModeLocksUdp
+                                  && !fileModeBusy;
     const bool udpDestinationEditable = udpModeAvailable
                                         && !m_udpConnected
                                         && !udpConnectionBusy
@@ -2018,9 +2416,41 @@ void MainWindow::updateControlStates()
                                   && m_udpConnected
                                   && m_udpTestRunning
                                   && !udpConnectionBusy
-                                  && !udpCommandBusy);
-}
+                                  && !udpCommandBusy
+                                  && !fileModeBusy);
 
+    const bool fileModeAvailable = fileWorkerAvailable && !otherModeLocksFile;
+    const bool fileControlsEditable = fileModeAvailable && !fileModeBusy;
+    const QFileInfo selectedFileInfo(m_selectedFilePath);
+    const bool selectedFileAvailable = !m_selectedFilePath.isEmpty()
+                                       && selectedFileInfo.exists()
+                                       && selectedFileInfo.isFile();
+
+    ui->fileSelectButton->setEnabled(fileControlsEditable);
+    ui->fileCounterBitsComboBox->setEnabled(fileControlsEditable);
+    ui->fileInitValueLineEdit->setEnabled(fileControlsEditable);
+    ui->fileSizeUnitComboBox->setEnabled(fileControlsEditable);
+    ui->fileFolderLineEdit->setEnabled(fileModeAvailable);
+    ui->fileNameLineEdit->setEnabled(fileModeAvailable);
+    ui->fileSizeLineEdit->setEnabled(fileModeAvailable);
+    ui->fileValueCountLineEdit->setEnabled(fileModeAvailable);
+    ui->fileLastValueLineEdit->setEnabled(fileModeAvailable);
+
+    ui->fileCheckButton->setText(
+        m_fileCheckRunning ? QStringLiteral("STOP")
+                           : QStringLiteral("CHECK"));
+    if (m_fileCheckRunning)
+    {
+        ui->fileCheckButton->setEnabled(fileWorkerAvailable
+                                        && !m_fileCheckCommandPending);
+    }
+    else
+    {
+        ui->fileCheckButton->setEnabled(fileControlsEditable
+                                        && selectedFileAvailable
+                                        && !m_fileCheckCommandPending);
+    }
+}
 /*-----------------------------------------------------------------------------*/
 
 /**
@@ -2192,7 +2622,7 @@ void MainWindow::closeLogFile()
  * @brief Restores settings from the previous run.
  * @param none
  * @return none
- * @detail Loads window geometry, the selected COM port, and Pattern fields from
+ * @detail Loads window geometry plus saved COM, UDP, and FILE preferences from
  *         QSettings.
  */
 void MainWindow::loadSettings()
@@ -2264,6 +2694,33 @@ void MainWindow::loadSettings()
                        QStringLiteral("100"))
             .toString());
 
+    m_fileLastFolder = settings.value(
+        QStringLiteral("file/lastFolder"),
+        QCoreApplication::applicationDirPath()).toString();
+    if (m_fileLastFolder.trimmed().isEmpty()
+        || !QDir(m_fileLastFolder).exists())
+    {
+        m_fileLastFolder = QCoreApplication::applicationDirPath();
+    }
+    selectComboBoxText(
+        ui->fileCounterBitsComboBox,
+        settings.value(QStringLiteral("file/pattern/counterBits"),
+                       QStringLiteral("32"))
+            .toString());
+    ui->fileInitValueLineEdit->setText(
+        settings.value(QStringLiteral("file/pattern/initValue"),
+                       QStringLiteral("0"))
+            .toString());
+    selectComboBoxText(
+        ui->fileSizeUnitComboBox,
+        settings.value(QStringLiteral("file/sizeUnit"),
+                       QStringLiteral("B"))
+            .toString());
+    m_selectedFilePath.clear();
+    m_selectedFileSizeBytes = 0;
+    ui->fileFolderLineEdit->clear();
+    ui->fileNameLineEdit->clear();
+
     if (settings.status() != QSettings::NoError)
     {
         appendEvent(tr("failed to read saved QSettings"),
@@ -2277,8 +2734,8 @@ void MainWindow::loadSettings()
  * @brief Saves the current application settings.
  * @param none
  * @return none
- * @detail Normalizes the fields and saves window geometry, COM settings, and Pattern
- *         through QSettings.
+ * @detail Normalizes editable fields and saves window geometry plus COM, UDP, and FILE
+ *         preferences through QSettings.
  */
 void MainWindow::saveSettings()
 {
@@ -2289,6 +2746,7 @@ void MainWindow::saveSettings()
     normalizeUdpInitialValue();
     normalizeUdpTogether();
     normalizeUdpPeriod();
+    normalizeFileInitialValue();
 
     QSettings settings;
     settings.setValue(QStringLiteral("window/geometry"), saveGeometry());
@@ -2331,6 +2789,14 @@ void MainWindow::saveSettings()
                       ui->udpTogetherLineEdit->text());
     settings.setValue(QStringLiteral("udp/pattern/periodMs"),
                       ui->udpPeriodMsLineEdit->text());
+    settings.setValue(QStringLiteral("file/lastFolder"),
+                      m_fileLastFolder);
+    settings.setValue(QStringLiteral("file/pattern/counterBits"),
+                      ui->fileCounterBitsComboBox->currentText());
+    settings.setValue(QStringLiteral("file/pattern/initValue"),
+                      ui->fileInitValueLineEdit->text());
+    settings.setValue(QStringLiteral("file/sizeUnit"),
+                      ui->fileSizeUnitComboBox->currentText());
     settings.sync();
 
     if (settings.status() != QSettings::NoError)
@@ -2346,8 +2812,8 @@ void MainWindow::saveSettings()
  * @brief Performs one-time application shutdown.
  * @param none
  * @return none
- * @detail Invokes both receiver-worker shutdown slots through blocking queued calls,
- *         waits for both QThreads, processes final events, saves settings, and closes
+ * @detail Invokes all worker shutdown slots through blocking queued calls,
+ *         waits for all QThreads, processes final events, saves settings, and closes
  *         the log.
  */
 void MainWindow::prepareShutdown()
@@ -2400,8 +2866,28 @@ void MainWindow::prepareShutdown()
         m_udpRxWorker = nullptr;
     }
 
+    if (m_fileCheckWorker != nullptr && m_fileCheckThread.isRunning())
+    {
+        const bool invoked = QMetaObject::invokeMethod(
+            m_fileCheckWorker,
+            "shutdown",
+            Qt::BlockingQueuedConnection);
+        if (!invoked)
+        {
+            appendEvent(tr("failed to invoke FILE worker shutdown"),
+                        EventType::Error);
+        }
+
+        QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
+        m_fileCheckThread.quit();
+        m_fileCheckThread.wait();
+        QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
+        m_fileCheckWorker = nullptr;
+    }
+
     m_workerReady = false;
     m_udpWorkerReady = false;
+    m_fileWorkerReady = false;
     m_portOpen = false;
     m_testRunning = false;
     m_portOperationPending = false;
@@ -2412,9 +2898,11 @@ void MainWindow::prepareShutdown()
     m_udpTestRunning = false;
     m_udpReceptionCommandPending = false;
     m_udpDisconnectRequestedByUser = false;
+    m_fileCheckRunning = false;
+    m_fileCheckCommandPending = false;
 
     saveSettings();
-    appendEvent(tr("RxDataTester (v.1.7) stopped"),
+    appendEvent(tr("RxDataTester (v.1.9) stopped"),
                 EventType::Normal);
     closeLogFile();
 }
@@ -3140,6 +3628,437 @@ quint64 MainWindow::udpMaximumCounterValue() const
 
     return (quint64(1) << counterBits) - quint64(1);
 }
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Recalculates all read-only FILE Pattern fields.
+ * @param logAlignmentWarning true to add a new warning for fractional value count.
+ * @return none
+ * @detail Uses the exact selected-file size, selected counter width, and init value to
+ *         display file size, value count, trailing bytes, and expected last value.
+ */
+void MainWindow::updateFileDerivedFields(bool logAlignmentWarning)
+{
+    const QFileInfo fileInfo(m_selectedFilePath);
+    if (m_selectedFilePath.isEmpty() || !fileInfo.exists() || !fileInfo.isFile())
+    {
+        m_selectedFileSizeBytes = 0;
+        ui->fileSizeLineEdit->setText(formatFileSize(0));
+        ui->fileValueCountLineEdit->setText(QStringLiteral("0"));
+        ui->fileLastValueLineEdit->setText(QStringLiteral("--"));
+        m_lastFileAlignmentWarningKey.clear();
+        return;
+    }
+
+    m_selectedFileSizeBytes = fileInfo.size();
+    const quint64 counterSize = fileCounterBytes();
+    const quint64 completeValues =
+        static_cast<quint64>(m_selectedFileSizeBytes
+                             / static_cast<qint64>(counterSize));
+    const qint64 trailingBytes =
+        m_selectedFileSizeBytes % static_cast<qint64>(counterSize);
+
+    ui->fileSizeLineEdit->setText(formatFileSize(m_selectedFileSizeBytes));
+    ui->fileValueCountLineEdit->setText(
+        formatFileValueCount(completeValues, trailingBytes, counterSize));
+
+    quint64 initialValue = 0;
+    if (completeValues == 0 || !parseFileInitialValue(&initialValue))
+    {
+        ui->fileLastValueLineEdit->setText(QStringLiteral("--"));
+    }
+    else
+    {
+        const quint64 mask = fileMaximumCounterValue();
+        const quint64 offset = (completeValues - quint64(1)) & mask;
+        const quint64 lastValue = (initialValue + offset) & mask;
+        ui->fileLastValueLineEdit->setText(
+            formatFileCounterValue(lastValue));
+    }
+
+    if (trailingBytes <= 0)
+    {
+        m_lastFileAlignmentWarningKey.clear();
+        return;
+    }
+
+    const QString warningKey =
+        QStringLiteral("%1|%2|%3")
+            .arg(m_selectedFilePath)
+            .arg(m_selectedFileSizeBytes)
+            .arg(ui->fileCounterBitsComboBox->currentText());
+    if (logAlignmentWarning && warningKey != m_lastFileAlignmentWarningKey)
+    {
+        appendEvent(
+            tr("WARNING: FILE size %1 B is not divisible by the %2-byte counter; "
+               "value count=%3; trailing_bytes=%4; trailing bytes will not be "
+               "interpreted as a counter")
+                .arg(QString::number(m_selectedFileSizeBytes),
+                     QString::number(counterSize),
+                     formatFileValueCount(completeValues,
+                                          trailingBytes,
+                                          counterSize),
+                     QString::number(trailingBytes)),
+            EventType::Normal);
+        m_lastFileAlignmentWarningKey = warningKey;
+    }
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Resets FILE Statistics widgets to their idle state.
+ * @param none
+ * @return none
+ * @detail Displays zero OK and ERR values and clears Chunks min/avrg/max fields.
+ */
+void MainWindow::resetFileStatistics()
+{
+    ui->fileOkValueLabel->setText(QStringLiteral("0 (0%)"));
+    ui->fileErrValueLabel->setText(QStringLiteral("0 (0%)"));
+    ui->fileChunkMinValueLabel->setText(QStringLiteral("--"));
+    ui->fileChunkAverageValueLabel->setText(QStringLiteral("--"));
+    ui->fileChunkMaxValueLabel->setText(QStringLiteral("--"));
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Reads and validates FILE Pattern settings.
+ * @param settings Output pointer for derived and validated FILE settings.
+ * @param errorText Output pointer for a validation error message.
+ * @return true when the selected file and Pattern are valid; otherwise false.
+ * @detail Rechecks the current file size, init range, complete-value count, expected last
+ *         value, and trailing-byte count immediately before CHECK.
+ */
+bool MainWindow::readFilePatternSettings(FilePatternSettings *settings,
+                                         QString *errorText) const
+{
+    if (settings == nullptr || errorText == nullptr)
+    {
+        return false;
+    }
+
+    const QFileInfo fileInfo(m_selectedFilePath);
+    if (m_selectedFilePath.isEmpty() || !fileInfo.exists() || !fileInfo.isFile())
+    {
+        *errorText = tr("select an existing file first");
+        return false;
+    }
+
+    bool counterBitsOk = false;
+    const int counterBits =
+        ui->fileCounterBitsComboBox->currentText().toInt(&counterBitsOk, 10);
+    if (!counterBitsOk
+        || (counterBits != 8 && counterBits != 16 && counterBits != 32))
+    {
+        *errorText = tr("invalid FILE counter width");
+        return false;
+    }
+
+    quint64 initialValue = 0;
+    if (!parseFileInitialValue(&initialValue))
+    {
+        *errorText = tr("FILE init value does not fit the selected counter width");
+        return false;
+    }
+
+    const quint64 counterSize = static_cast<quint64>(counterBits / 8);
+    const qint64 fileSizeBytes = fileInfo.size();
+    if (fileSizeBytes < 0)
+    {
+        *errorText = tr("failed to determine FILE size");
+        return false;
+    }
+
+    const quint64 completeValues =
+        static_cast<quint64>(fileSizeBytes / static_cast<qint64>(counterSize));
+    const qint64 trailingBytes =
+        fileSizeBytes % static_cast<qint64>(counterSize);
+    const quint64 mask = counterBits == 32
+                             ? 0xFFFFFFFFULL
+                             : ((quint64(1) << counterBits) - quint64(1));
+    const quint64 lastValue = completeValues == 0
+                                  ? initialValue
+                                  : (initialValue
+                                     + ((completeValues - quint64(1)) & mask))
+                                        & mask;
+
+    settings->counterBits = counterBits;
+    settings->counterBytes = static_cast<int>(counterSize);
+    settings->initialValue = initialValue;
+    settings->maximumCounterValue = mask;
+    settings->completeValueCount = completeValues;
+    settings->lastValue = lastValue;
+    settings->fileSizeBytes = fileSizeBytes;
+    settings->trailingBytes = trailingBytes;
+    settings->hexadecimalDisplay =
+        ui->fileInitValueLineEdit->text().trimmed().startsWith(
+            QStringLiteral("0x"),
+            Qt::CaseInsensitive);
+    errorText->clear();
+    return true;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Parses the FILE initial counter value.
+ * @param value Output pointer for the parsed unsigned value.
+ * @return true when decimal or 0x-prefixed input fits the selected FILE counter.
+ * @detail The method preserves the user's display base and does not modify widgets.
+ */
+bool MainWindow::parseFileInitialValue(quint64 *value) const
+{
+    if (value == nullptr)
+    {
+        return false;
+    }
+
+    QString text = ui->fileInitValueLineEdit->text().trimmed();
+    if (text.isEmpty())
+    {
+        return false;
+    }
+
+    const bool hexadecimal =
+        text.startsWith(QStringLiteral("0x"), Qt::CaseInsensitive);
+    if (hexadecimal)
+    {
+        text.remove(0, 2);
+    }
+    if (text.isEmpty())
+    {
+        return false;
+    }
+
+    bool conversionOk = false;
+    const quint64 convertedValue =
+        text.toULongLong(&conversionOk, hexadecimal ? 16 : 10);
+    if (!conversionOk || convertedValue > fileMaximumCounterValue())
+    {
+        return false;
+    }
+
+    *value = convertedValue;
+    return true;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Returns the selected FILE counter size in bytes.
+ * @param none
+ * @return A size of 1, 2, or 4 bytes.
+ * @detail Unexpected GUI text is safely interpreted as one byte.
+ */
+quint64 MainWindow::fileCounterBytes() const
+{
+    const int counterBits = ui->fileCounterBitsComboBox->currentText().toInt();
+    if (counterBits != 8 && counterBits != 16 && counterBits != 32)
+    {
+        return 1U;
+    }
+
+    return static_cast<quint64>(counterBits / 8);
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Returns the maximum value of the selected FILE counter.
+ * @param none
+ * @return Maximum unsigned value for the current 8-, 16-, or 32-bit width.
+ * @detail Used for validation and natural wrap-around of the expected last value.
+ */
+quint64 MainWindow::fileMaximumCounterValue() const
+{
+    const int counterBits = ui->fileCounterBitsComboBox->currentText().toInt();
+    if (counterBits == 32)
+    {
+        return 0xFFFFFFFFULL;
+    }
+    if (counterBits == 16)
+    {
+        return 0xFFFFULL;
+    }
+
+    return 0xFFULL;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Formats the selected file size in the current unit.
+ * @param fileSizeBytes Exact file size in bytes.
+ * @return Compact B, KB, MB, or GB numeric text without a unit suffix.
+ * @detail Binary multipliers are used: 1 KB=1024 B, 1 MB=1024^2 B, and 1 GB=1024^3 B.
+ */
+QString MainWindow::formatFileSize(qint64 fileSizeBytes) const
+{
+    const qint64 safeBytes = qMax<qint64>(0, fileSizeBytes);
+    const QString unit = ui->fileSizeUnitComboBox->currentText();
+    quint64 multiplier = 1;
+    if (unit == QStringLiteral("KB"))
+    {
+        multiplier = 1024ULL;
+    }
+    else if (unit == QStringLiteral("MB"))
+    {
+        multiplier = 1024ULL * 1024ULL;
+    }
+    else if (unit == QStringLiteral("GB"))
+    {
+        multiplier = 1024ULL * 1024ULL * 1024ULL;
+    }
+
+    if (multiplier == 1)
+    {
+        return QString::number(safeBytes);
+    }
+
+    QString text = QString::number(
+        static_cast<double>(safeBytes) / static_cast<double>(multiplier),
+        'f',
+        9);
+    while (text.endsWith(QLatin1Char('0')))
+    {
+        text.chop(1);
+    }
+    if (text.endsWith(QLatin1Char('.')))
+    {
+        text.chop(1);
+    }
+    return text.isEmpty() ? QStringLiteral("0") : text;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Formats exact or fractional FILE value count.
+ * @param completeValues Number of complete counters in the file.
+ * @param trailingBytes Remaining bytes after the last complete counter.
+ * @param counterBytes Selected counter size in bytes.
+ * @return Exact decimal count, including .25, .5, or .75 when required.
+ * @detail Avoids floating-point rounding for very large files.
+ */
+QString MainWindow::formatFileValueCount(quint64 completeValues,
+                                         qint64 trailingBytes,
+                                         quint64 counterBytes) const
+{
+    QString text = QString::number(completeValues);
+    if (trailingBytes <= 0 || counterBytes <= 1)
+    {
+        return text;
+    }
+
+    if (counterBytes == 2 && trailingBytes == 1)
+    {
+        return text + QStringLiteral(".5");
+    }
+
+    if (counterBytes == 4)
+    {
+        if (trailingBytes == 1)
+        {
+            return text + QStringLiteral(".25");
+        }
+        if (trailingBytes == 2)
+        {
+            return text + QStringLiteral(".5");
+        }
+        if (trailingBytes == 3)
+        {
+            return text + QStringLiteral(".75");
+        }
+    }
+
+    return text;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Formats a FILE counter value in the init-value display base.
+ * @param value Unsigned counter value to format.
+ * @return Decimal or uppercase 0x-prefixed hexadecimal text.
+ * @detail Hexadecimal is selected when the current init field begins with 0x.
+ */
+QString MainWindow::formatFileCounterValue(quint64 value) const
+{
+    const quint64 maskedValue = value & fileMaximumCounterValue();
+    if (ui->fileInitValueLineEdit->text().trimmed().startsWith(
+            QStringLiteral("0x"),
+            Qt::CaseInsensitive))
+    {
+        return QStringLiteral("0x%1")
+            .arg(QString::number(maskedValue, 16).toUpper());
+    }
+
+    return QString::number(maskedValue);
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Formats a percentage for FILE Statistics.
+ * @param part Numerator value.
+ * @param total Denominator value.
+ * @return Percentage text with insignificant trailing zeros removed.
+ * @detail Returns 0 when no complete values have been processed.
+ */
+QString MainWindow::formatFilePercentage(quint64 part, quint64 total) const
+{
+    if (total == 0)
+    {
+        return QStringLiteral("0");
+    }
+
+    QString text = QString::number(
+        (static_cast<double>(part) * 100.0) / static_cast<double>(total),
+        'f',
+        6);
+    while (text.endsWith(QLatin1Char('0')))
+    {
+        text.chop(1);
+    }
+    if (text.endsWith(QLatin1Char('.')))
+    {
+        text.chop(1);
+    }
+    return text.isEmpty() ? QStringLiteral("0") : text;
+}
+
+/*-----------------------------------------------------------------------------*/
+
+/**
+ * @brief Builds the FILE Pattern description for the event log.
+ * @param settings Validated FILE Pattern settings.
+ * @return A file/counter/init/last/count/size/trailing/bo=LE description string.
+ * @detail Hexadecimal init input keeps FILE counter values in hexadecimal form.
+ */
+QString MainWindow::filePatternDescription(
+    const FilePatternSettings &settings) const
+{
+    const QString lastValueText = settings.completeValueCount == 0
+                                      ? QStringLiteral("--")
+                                      : formatFileCounterValue(settings.lastValue);
+    return tr("file=%1; counter, bits=%2; init value=%3; last value=%4; "
+              "value count=%5; complete values=%6; file size=%7 B; "
+              "trailing bytes=%8; bo=LE")
+        .arg(QDir::toNativeSeparators(m_selectedFilePath))
+        .arg(settings.counterBits)
+        .arg(formatFileCounterValue(settings.initialValue))
+        .arg(lastValueText)
+        .arg(formatFileValueCount(settings.completeValueCount,
+                                  settings.trailingBytes,
+                                  static_cast<quint64>(settings.counterBytes)))
+        .arg(QString::number(settings.completeValueCount))
+        .arg(QString::number(settings.fileSizeBytes))
+        .arg(QString::number(settings.trailingBytes));
+}
+
 
 /*-----------------------------------------------------------------------------*/
 

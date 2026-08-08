@@ -1,9 +1,9 @@
-# RxDataTester (v.1.7)
+# RxDataTester (v.1.9)
 
-RxDataTester is a Qt 5.12 + qmake utility that receives a binary counter
-pattern through COM or UDP and verifies that counter values increase
-continuously. The GUI, source comments, EVENTS messages, and text logs are
-entirely in English.
+RxDataTester is a Qt 5.12 + qmake utility that receives or reads a binary
+counter pattern through COM, UDP, or a selected file and verifies that counter
+values increase continuously. The GUI, source comments, EVENTS messages, and
+text logs are entirely in English.
 
 ## Version 1.7 high-rate UDP receive pipeline
 
@@ -79,6 +79,95 @@ extreme temporary backlog `counter, ok`, `counter, err`, and `curr_count` may
 lag the receive totals briefly. `queue_depth` and `max_queue_depth` show that
 lag explicitly.
 
+
+## Version 1.9 FILE Statistics alignment
+
+Version 1.9 keeps the FILE checker logic unchanged and moves the `OK` and `ERR`
+statistics values to the left, immediately after their labels.
+
+## Version 1.8 FILE verification
+
+Version 1.8 adds a third `FILE` tab for checking binary counter files created by
+TxDataTester or another source. File I/O and counter verification execute in a
+dedicated `FileCheckWorker` thread, while the GUI, EVENTS, and text log remain in
+the main thread.
+
+The File group contains read-only Folder and File fields plus a large SELECT
+button. SELECT opens the standard Qt file dialog. After selection, the absolute
+folder, file name, and exact byte size are displayed and recorded in EVENTS.
+The dialog starts in the last selected folder; on the first run it starts next
+to the executable.
+
+FILE Pattern contains:
+
+- `counter, bits`: 8, 16, or 32;
+- `init value`: decimal or `0x`-prefixed hexadecimal;
+- read-only `last value`;
+- read-only `value count`;
+- read-only `file size` with B, KB, MB, or GB display units;
+- a large CHECK button that changes to STOP while verification is active.
+
+The exact file byte size is kept internally. B, KB, MB, and GB use binary
+multipliers. `value count` is calculated as:
+
+```text
+file_size_bytes / counter_bytes
+```
+
+When the file size is not divisible by the counter size, the displayed count is
+fractional, for example `2500.25`, `2500.5`, or `2500.75`. EVENTS records a
+black warning and the trailing one to three bytes are not interpreted as a
+counter. `last value` is calculated from the complete counter fields only and
+uses natural unsigned wrap-around.
+
+CHECK opens the selected file in read-only mode and verifies little-endian
+counter values from the configured init value. One persistent 4 MiB
+`QByteArray` is allocated once in the FILE worker thread and reused for every
+read. Up to three carry bytes are preserved between short reads; normal 4 MiB
+blocks are divisible by all supported counter sizes.
+
+For each complete value:
+
+```text
+received == expected
+    OK += 1
+    next expected = received + 1
+
+received != expected
+    ERR += 1
+    chunk = (received - previous_received) modulo counter width
+    next expected = received + 1
+```
+
+A detailed mismatch event includes the byte offset from the beginning of the
+file, expected value, received value, counter-jump size, and next expected value.
+The Chunks convention follows the GUI examples: `1000 -> 1002` is a chunk of 2,
+and `2000 -> 2010` is a chunk of 10.
+
+```text
+FILE counter error: offset=4096 B; expected=1000; received=1002; skipped=2; next_expected=1003
+```
+
+Detailed mismatch output is limited to 10,000 entries to protect the GUI and log
+from an unbounded corrupted file. All later mismatches remain included in final
+Statistics and the completion event reports the number of suppressed details.
+
+FILE Statistics is refreshed approximately once per second:
+
+- `OK`: matching values and their percentage of processed complete values;
+- `ERR`: mismatching values and their percentage;
+- `Chunks`: minimum, arithmetic average, and maximum counter-jump size over
+  mismatch events.
+
+Natural completion writes a `FINISH file check` result to EVENTS and the text
+log. STOP closes the file in the worker thread and writes final partial results.
+The summary includes checked values, OK/ERR percentages, Chunks statistics,
+trailing bytes, elapsed time, and detailed/suppressed error counts.
+
+COM, UDP, and FILE operations are mutually exclusive. OPEN or UDP CONNECT
+disables FILE; an active or pending FILE check disables COM and UDP until it
+finishes or is stopped.
+
 ## Build
 
 Open `RxDataTester.pro` in Qt Creator configured for Qt 5.12, or build from a
@@ -108,7 +197,7 @@ are separated with 81-character divider lines.
 
 ## Thread architecture
 
-The application uses three event-loop threads:
+The application uses four event-loop threads:
 
 ```text
 GUI thread
@@ -135,10 +224,18 @@ UDP RX high-priority thread
 |- bounded packet-processing timer
 |- counter verification across datagrams
 |- UDP Statistics and 20-second log snapshots
+
+FILE check thread
+|- FileCheckWorker
+|- QFile opened read-only
+|- one persistent 4 MiB read buffer
+|- little-endian 8/16/32-bit counter verification
+|- byte-offset error reporting
+|- FILE OK/ERR and Chunks Statistics
 ```
 
-GUI painting, window movement, and log-file flushing do not execute in the COM
-or UDP receiver threads.
+GUI painting, window movement, and log-file flushing do not execute in the COM,
+UDP, or FILE worker threads.
 
 ## COM tab
 
@@ -185,11 +282,12 @@ A successful ping confirms IP reachability, not that the transmitter has
 started sending UDP data. START becomes available only after the UDP socket has
 been bound successfully.
 
-The COM and UDP modes are mutually exclusive:
+The COM, UDP, and FILE modes are mutually exclusive:
 
 ```text
-UDP CONNECT -> COM tab is disabled until DISCONNECT
-COM OPEN     -> UDP tab is disabled until CLOSE
+UDP CONNECT -> COM and FILE tabs are disabled until DISCONNECT
+COM OPEN     -> UDP and FILE tabs are disabled until CLOSE
+FILE CHECK   -> COM and UDP tabs are disabled until FINISH or STOP
 ```
 
 ## UDP Pattern and START
@@ -304,5 +402,7 @@ A UDP counter mismatch is logged in this form:
 ## Saved settings
 
 QSettings stores window geometry, COM settings, COM Pattern, UDP IP and Port,
-and UDP Pattern values. COM and UDP connections are not restored automatically
-after restart; use OPEN or CONNECT again.
+UDP Pattern values, the FILE counter width, FILE init value, FILE size display
+unit, and the last file-selection folder. COM and UDP connections and a selected
+FILE are not restored automatically after restart; use OPEN, CONNECT, or SELECT
+again.
